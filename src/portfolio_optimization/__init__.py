@@ -1,0 +1,185 @@
+"""Portfolio Optimization canonical Python engine.
+
+Importing this package performs no network requests, ML training, package
+installations, GUI initialization, or API key validation.
+"""
+
+from __future__ import annotations
+
+from . import state
+from .analytics import (
+    analizar_contribucion_marginal_riesgo,
+    analizar_rendimiento_historico,
+    armar_cartera,
+    generar_frontera_eficiente,
+    generar_grafico_riesgo,
+    generar_heatmap_correlaciones,
+    generar_underwater_plot,
+)
+from .config import (
+    ALPHA_VANTAGE_API_KEYS,
+    ALPHA_VANTAGE_BASE_URL,
+    FRED_API_KEY,
+    FRED_BASE_URL,
+    GEMINI_API_KEY,
+    GOOGLE_NEWS_RSS_URL,
+    configure_runtime,
+    get_alpha_vantage_api_keys,
+    get_fred_api_key,
+    get_gemini_api_key,
+)
+from .country_risk import (
+    calcular_primas_riesgo_pais,
+    country_etf_mapping,
+    obtener_riesgo_pais_argentina,
+)
+from .market_data import (
+    _download_prices,
+    calcular_cvar_historico,
+    descargar_precios_historicos,
+    get_risk_free_rate,
+    metricas_portfolio,
+    obtener_tasa_libre_riesgo,
+)
+from .ml import (
+    DataIngestor,
+    IngestedData,
+    PortfolioPredictor,
+    PortfolioProcessor,
+    _normalizar_df_yf,
+    _process_macro_with_lag,
+    _train_long_term_model_robust,
+    _train_short_term_model_robust,
+    _train_xgb_robust,
+)
+from .notebook_ui import (
+    banderas_paises,
+    crear_interfaz_portfolio,
+    crear_interfaz_proyecciones_ml,
+    ejecutar_interfaz_analisis,
+    mostrar_proyecciones_ml,
+    mostrar_rebalanceo,
+    obtener_info_activo,
+    paises_disponibles,
+)
+from .optimization import (
+    AnalysisResult,
+    _calc_cvar,
+    _calc_historical_performance,
+    _calc_mcr,
+    _is_existing_portfolio,
+    _optimize_min_cvar,
+    _optimize_min_variance,
+    _portfolio_metrics,
+    _simulate_portfolios,
+    analyze_portfolio,
+    black_litterman_returns,
+    build_ml_views_for_bl,
+    compute_equilibrium_returns,
+    compute_expected_returns_pipeline,
+    compute_market_weights,
+    compute_stress_weight_caps,
+    forward_looking_cov_adjustment,
+    get_current_vix,
+    get_market_caps,
+    get_sector_map,
+    optimize_sharpe_hhi,
+    optimize_with_sector_and_stress,
+    regime_adjusted_covariance,
+    run_all_stress_tests,
+    shrinkage_covariance,
+    stress_test_corr_one,
+    stress_test_systemic,
+    stress_test_vol_shock,
+)
+from .pipeline import (
+    _calcular_rebalanceo,
+    ejecutar_analisis_completo,
+    run_portfolio_analysis,
+)
+
+__all__ = [
+    "state",
+    # Config
+    "ALPHA_VANTAGE_API_KEYS",
+    "ALPHA_VANTAGE_BASE_URL",
+    "FRED_API_KEY",
+    "FRED_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_NEWS_RSS_URL",
+    "configure_runtime",
+    "get_alpha_vantage_api_keys",
+    "get_fred_api_key",
+    "get_gemini_api_key",
+    # Country risk
+    "country_etf_mapping",
+    "obtener_riesgo_pais_argentina",
+    "calcular_primas_riesgo_pais",
+    # Market data
+    "_download_prices",
+    "get_risk_free_rate",
+    "obtener_tasa_libre_riesgo",
+    "descargar_precios_historicos",
+    "metricas_portfolio",
+    "calcular_cvar_historico",
+    # Optimization & stress
+    "AnalysisResult",
+    "analyze_portfolio",
+    "optimize_sharpe_hhi",
+    "optimize_with_sector_and_stress",
+    "compute_stress_weight_caps",
+    "get_market_caps",
+    "compute_market_weights",
+    "compute_equilibrium_returns",
+    "black_litterman_returns",
+    "build_ml_views_for_bl",
+    "shrinkage_covariance",
+    "regime_adjusted_covariance",
+    "get_current_vix",
+    "forward_looking_cov_adjustment",
+    "stress_test_corr_one",
+    "stress_test_vol_shock",
+    "stress_test_systemic",
+    "run_all_stress_tests",
+    "compute_expected_returns_pipeline",
+    "get_sector_map",
+    "_optimize_min_cvar",
+    "_optimize_min_variance",
+    "_portfolio_metrics",
+    "_calc_mcr",
+    "_calc_historical_performance",
+    "_is_existing_portfolio",
+    "_calc_cvar",
+    "_simulate_portfolios",
+    # ML
+    "IngestedData",
+    "DataIngestor",
+    "PortfolioProcessor",
+    "PortfolioPredictor",
+    "_normalizar_df_yf",
+    "_train_xgb_robust",
+    "_train_short_term_model_robust",
+    "_train_long_term_model_robust",
+    "_process_macro_with_lag",
+    # Pipeline
+    "_calcular_rebalanceo",
+    "ejecutar_analisis_completo",
+    "run_portfolio_analysis",
+    # Analytics
+    "generar_frontera_eficiente",
+    "analizar_rendimiento_historico",
+    "generar_heatmap_correlaciones",
+    "generar_underwater_plot",
+    "analizar_contribucion_marginal_riesgo",
+    "generar_grafico_riesgo",
+    "armar_cartera",
+    # Notebook UI
+    "banderas_paises",
+    "paises_disponibles",
+    "obtener_info_activo",
+    "crear_interfaz_portfolio",
+    "ejecutar_interfaz_analisis",
+    "mostrar_proyecciones_ml",
+    "crear_interfaz_proyecciones_ml",
+    "mostrar_rebalanceo",
+]
