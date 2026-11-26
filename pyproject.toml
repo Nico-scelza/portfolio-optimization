@@ -4,32 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portfolio-optimization"
-version = "0.1.0"
-description = "Faithful Python package migration of the Portfolio Optimization & ML Projection notebook."
+version = "0.2.0"
+description = "Stateless multi-asset portfolio optimization engine (Annualized DCF + Black-Litterman, Weekly W-FRI VIX-Regime Covariance, ERC/HRP/Sharpe/MinVar/CVaR, Fixed Income YTM & IOL Quotes, Multi-Broker Rebalancing)."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "pandas",
-    "matplotlib",
+    "pandas>=2.1",
+    "scipy",
+    "scikit-learn",
     "requests",
     "urllib3",
     "beautifulsoup4",
     "yfinance",
-    "xgboost",
-    "scikit-learn",
-    "scipy",
-    "tqdm",
-    "jinja2",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
 notebook = [
     "ipython",
-    "ipywidgets",
-    "plotly",
-    "feedparser",
-    "tkhtmlview",
 ]
 dev = [
     "pytest",
