@@ -39,10 +39,16 @@ def annualize_dcf_view(
     view: DCFViewConfig,
     *,
     current_price_usd: Optional[float] = None,
+    default_horizon_years: float = 5.0,
     default_confidence: float = 0.50,
     asset_subtype: str = "equity",
 ) -> DCFViewResult:
-    """Convert a validated DCF valuation view into an annualized expected return view."""
+    """Convert a validated DCF valuation view into an annualized expected return view.
+
+    When ``view.horizon_years`` is ``None``, inherits ``default_horizon_years``
+    (from ``BlackLittermanConfig.default_dcf_horizon_years``). Explicit individual
+    horizons always take precedence.
+    """
     iid = instrument_id.strip().upper()
     warnings: List[str] = []
     assumptions: List[str] = []
@@ -59,7 +65,10 @@ def annualize_dcf_view(
             asset_id=iid,
         )
 
-    horizon = float(view.horizon_years)
+    raw_horizon = default_horizon_years if view.horizon_years is None else view.horizon_years
+    horizon = float(raw_horizon)
+    if not math.isfinite(horizon) or horizon <= 0.0:
+        raise ConfigurationError(f"Effective DCF horizon_years ({horizon}) for '{iid}' must be > 0.", asset_id=iid)
     conf = float(default_confidence if view.confidence is None else view.confidence)
     p0 = view.current_price if view.current_price is not None else current_price_usd
 
@@ -283,12 +292,27 @@ def compute_black_litterman(
     prior_warnings: Optional[List[str]] = None,
 ) -> BlackLittermanResult:
     """Run multi-asset Black-Litterman on consistent annual USD excess returns."""
-    tickers = list(cov_matrix.index)
-    sigma = cov_matrix.loc[tickers, tickers].to_numpy(dtype=float)
+    raw_tickers = list(cov_matrix.index)
+    tickers = [str(t).strip().upper() for t in raw_tickers]
+    if len(set(tickers)) != len(tickers):
+        raise ConfigurationError("Covariance matrix contains duplicate asset IDs after normalization.")
+    cov_norm = cov_matrix.copy()
+    cov_norm.index = tickers
+    cov_norm.columns = [str(c).strip().upper() for c in cov_matrix.columns]
+    if set(cov_norm.columns) != set(tickers):
+        raise ConfigurationError("Covariance matrix index and columns do not match after ID normalization.")
+    cov_norm = cov_norm.loc[tickers, tickers]
+
+    ref_norm = reference_weights.copy()
+    ref_norm.index = [str(k).strip().upper() for k in ref_norm.index]
+    if ref_norm.index.duplicated().any():
+        raise ConfigurationError("Reference weights contain duplicate asset IDs after normalization.")
+
+    sigma = cov_norm.to_numpy(dtype=float)
     n = len(tickers)
     warnings_list = list(prior_warnings or [])
 
-    pi_excess = compute_equilibrium_returns(cov_matrix.loc[tickers, tickers], reference_weights, risk_aversion)
+    pi_excess = compute_equilibrium_returns(cov_norm, ref_norm, risk_aversion)
     mu_prior_total = pi_excess + float(rf_rate)
 
     active_assets: List[str] = []
@@ -299,10 +323,20 @@ def compute_black_litterman(
     omega_diag: List[float] = []
 
     tau_sigma = float(tau) * sigma
-    source_labels = view_source_labels or {}
+    source_labels = {str(k).strip().upper(): v for k, v in (view_source_labels or {}).items()}
 
+    # Validate & deduplicate view keys after strip().upper() (never silently overwrite!)
+    seen_view_ids: set[str] = set()
     for asset_id, (q_total, conf_raw) in (absolute_views_total or {}).items():
-        aid = asset_id.strip().upper()
+        aid = str(asset_id).strip().upper()
+        if aid in seen_view_ids:
+            raise ConfigurationError(
+                f"Duplicate Black-Litterman view asset ID '{aid}' after strip().upper() normalization "
+                f"(raw key '{asset_id}'). Remove duplicate views instead of silently overwriting.",
+                asset_id=aid,
+            )
+        seen_view_ids.add(aid)
+
         if aid not in tickers:
             warnings_list.append(f"View for '{aid}' ignored because asset is not in the active covariance universe.")
             continue
@@ -336,7 +370,7 @@ def compute_black_litterman(
     diagnostics: Dict[str, Any] = {
         "return_basis": "excess_return_over_rf_converted_once",
         "omega_calibration": "idzorek_absolute_view",
-        "posterior_solver": "woodbury_no_omega_inversion",
+        "posterior_solver": "equilibrated_woodbury_no_omega_inversion",
         "active_view_count": len(active_assets),
         "inactive_view_count": len(inactive_assets),
     }
@@ -354,7 +388,7 @@ def compute_black_litterman(
             risk_aversion=float(risk_aversion),
             tau=float(tau),
             prior_policy_used=prior_policy_used,
-            reference_weights=reference_weights.reindex(tickers),
+            reference_weights=ref_norm.reindex(tickers),
             prior_excess_returns=pi_excess,
             prior_total_returns=mu_prior_total,
             posterior_excess_returns=pi_excess.copy(),
@@ -379,26 +413,53 @@ def compute_black_litterman(
     S = 0.5 * (S + S.T)
     innovation = Q - (P @ pi_excess.to_numpy(dtype=float))
 
+    # Diagonal equilibration D^{-1} S D^{-1} eliminates artificial ill-conditioning when mixing
+    # high-confidence (c -> 1, small S_ii) and ultra-low-confidence (c -> 1e-13, huge S_ii) views.
+    diag_s = np.diag(S)
+    if np.any(diag_s <= 0.0) or not np.all(np.isfinite(diag_s)):
+        raise ConfigurationError("Black-Litterman view system matrix has non-positive or non-finite diagonal entries.")
+    inv_sqrt_d = 1.0 / np.sqrt(diag_s)
+    S_eq = (S * inv_sqrt_d[:, None]) * inv_sqrt_d[None, :]
+    S_eq = 0.5 * (S_eq + S_eq.T)
+    rhs_eq = innovation * inv_sqrt_d
+
     jitter_applied = 0.0
-    try:
-        cond = float(np.linalg.cond(S))
-        if not math.isfinite(cond) or cond > 1e12:
-            raise np.linalg.LinAlgError("Ill-conditioned S matrix")
-        gain_rhs = np.linalg.solve(S, innovation)
-    except np.linalg.LinAlgError:
-        jitter_applied = 1e-10 * max(float(np.mean(np.diag(S))), 1.0)
-        S_reg = S + np.eye(S.shape[0]) * jitter_applied
-        gain_rhs = np.linalg.solve(S_reg, innovation)
+    cond_eq = float(np.linalg.cond(S_eq))
+    if math.isfinite(cond_eq) and cond_eq <= 1e12:
+        y_eq = np.linalg.solve(S_eq, rhs_eq)
+    else:
+        # Check whether system is genuinely inconsistent (e.g. incompatible exact views on linearly dependent assets)
+        y_ls, _, _, _ = np.linalg.lstsq(S_eq, rhs_eq, rcond=None)
+        eq_res = float(np.linalg.norm(S_eq @ y_ls - rhs_eq, ord=np.inf))
+        rhs_norm = max(float(np.linalg.norm(rhs_eq, ord=np.inf)), 1.0)
+        if eq_res / rhs_norm > 1e-6:
+            raise ConfigurationError(
+                f"Black-Litterman view system is singular or inconsistent under equilibrated solve "
+                f"(cond={cond_eq:.2e}, rel_residual={eq_res / rhs_norm:.2e}). Check for conflicting exact views.",
+                details={"equilibrated_cond": cond_eq, "relative_residual": eq_res / rhs_norm},
+            )
+        jitter_applied = 1e-10
+        y_eq = np.linalg.solve(S_eq + np.eye(S_eq.shape[0]) * jitter_applied, rhs_eq)
         warnings_list.append(
-            f"Applied diagonal jitter ({jitter_applied:.2e}) to Black-Litterman view system matrix for numerical stability."
+            f"Applied equilibrated diagonal regularization ({jitter_applied:.2e}) to Black-Litterman view system (cond={cond_eq:.2e})."
         )
 
+    gain_rhs = y_eq * inv_sqrt_d
+    rel_residual = float(np.linalg.norm(S_eq @ y_eq - rhs_eq, ord=np.inf)) / max(
+        float(np.linalg.norm(rhs_eq, ord=np.inf)), 1.0
+    )
+
     pi_post_arr = pi_excess.to_numpy(dtype=float) + (tau_sigma @ P.T @ gain_rhs)
+    if not np.all(np.isfinite(pi_post_arr)):
+        raise ConfigurationError("Black-Litterman posterior produced non-finite expected returns.")
+
     pi_post = pd.Series(pi_post_arr, index=tickers, dtype=float)
     mu_post_total = pi_post + float(rf_rate)
 
     diagnostics["status"] = "posterior_computed"
     diagnostics["jitter_applied"] = jitter_applied
+    diagnostics["equilibrated_condition_number"] = cond_eq
+    diagnostics["equilibrated_relative_residual"] = rel_residual
 
     for t in tickers:
         if t in active_assets:
@@ -413,7 +474,7 @@ def compute_black_litterman(
         risk_aversion=float(risk_aversion),
         tau=float(tau),
         prior_policy_used=prior_policy_used,
-        reference_weights=reference_weights.reindex(tickers),
+        reference_weights=ref_norm.reindex(tickers),
         prior_excess_returns=pi_excess,
         prior_total_returns=mu_prior_total,
         posterior_excess_returns=pi_post,
@@ -471,6 +532,7 @@ def compute_expected_returns_pipeline(
                 iid,
                 inst.dcf_view,
                 current_price_usd=prices_map.get(iid),
+                default_horizon_years=cfg.default_dcf_horizon_years,
                 default_confidence=cfg.default_dcf_confidence,
                 asset_subtype=inst.asset_subtype,
             )

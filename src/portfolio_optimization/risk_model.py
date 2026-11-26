@@ -162,12 +162,58 @@ def ewma_covariance_weekly(
     *,
     half_life_weeks: float = 26.0,
     annualization_factor: float = WEEKS_PER_YEAR,
+    mean_mode: str = "zero",
+    gap_policy: str = "elapsed_weeks_decay",
 ) -> pd.DataFrame:
-    """Optional EWMA weekly covariance estimator (annualized ONCE, no extra stress multiplier)."""
+    """Optional strictly causal, gap-aware EWMA weekly covariance estimator (annualized ONCE).
+
+    Mathematical properties (AUD-14):
+    - Strictly causal: NEVER uses a full-sample mean. Supports ``mean_mode="zero"``
+      (RiskMetrics standard, default) and ``mean_mode="causal_recursive"`` (innovations
+      centered against prior causal EWMA mean). Appending observations after date ``t``
+      leaves the estimated state at ``t`` completely invariant.
+    - Gap-aware: validates strictly increasing W-FRI timestamps and scales prior state
+      by ``lambda ** delta_weeks`` when intermediate weeks are absent (under
+      ``gap_policy="elapsed_weeks_decay"``) or raises ``DataQualityError`` (under
+      ``gap_policy="error_on_gap"``), never treating multi-week returns as single-week
+      or inventing zero returns.
+    - Exact finite-sample weight normalization guarantees symmetry and positive
+      semi-definiteness before annualizing once by ``annualization_factor`` (52).
+    """
     if weekly_returns.empty or len(weekly_returns) < 2:
         raise DataQualityError("At least 2 weekly observations are required for EWMA covariance.")
+    if not math.isfinite(float(half_life_weeks)) or float(half_life_weeks) <= 0.0:
+        raise DataQualityError(f"'half_life_weeks' must be finite and > 0 (got {half_life_weeks}).")
+    if mean_mode not in ("zero", "causal_recursive"):
+        raise DataQualityError(f"Unsupported EWMA mean_mode '{mean_mode}'. Expected 'zero' or 'causal_recursive'.")
+    if gap_policy not in ("elapsed_weeks_decay", "error_on_gap"):
+        raise DataQualityError(f"Unsupported EWMA gap_policy '{gap_policy}'. Expected 'elapsed_weeks_decay' or 'error_on_gap'.")
 
-    df = weekly_returns.sort_index(ascending=True)
+    if isinstance(weekly_returns.index, pd.DatetimeIndex):
+        if not weekly_returns.index.is_monotonic_increasing:
+            raise DataQualityError("EWMA weekly_returns index must be strictly increasing chronologically.")
+        if weekly_returns.index.duplicated().any():
+            raise DataQualityError("EWMA weekly_returns index contains duplicate timestamps.")
+        non_friday = weekly_returns.index[weekly_returns.index.day_of_week != 4]
+        if len(non_friday) > 0:
+            raise DataQualityError(
+                f"EWMA weekly_returns requires W-FRI (Friday) timestamps; found non-Friday date(s): "
+                f"{[str(d.date()) for d in non_friday[:3]]}."
+            )
+        norm_idx = weekly_returns.index.normalize()
+        dt_weeks = ((norm_idx[1:] - norm_idx[:-1]) / pd.Timedelta(days=7)).to_numpy(dtype=float)
+        if np.any(dt_weeks < 1.0 - 1e-6) or np.any(np.abs(dt_weeks - np.round(dt_weeks)) > 1e-3):
+            raise DataQualityError("EWMA weekly_returns timestamps must be positive integer multiples of 7 days.")
+        dt_weeks = np.round(dt_weeks)
+        if gap_policy == "error_on_gap" and np.any(dt_weeks > 1.0):
+            raise DataQualityError(
+                f"EWMA weekly_returns contains missing week gap(s) (max delta={int(np.max(dt_weeks))} weeks) "
+                "under gap_policy='error_on_gap'."
+            )
+    else:
+        dt_weeks = np.ones(len(weekly_returns) - 1, dtype=float)
+
+    df = weekly_returns
     arr = df.to_numpy(dtype=float)
     if not np.all(np.isfinite(arr)):
         raise DataQualityError("Weekly returns for EWMA contain non-finite values.")
@@ -175,18 +221,33 @@ def ewma_covariance_weekly(
     n_obs, n_assets = arr.shape
     lam = 0.5 ** (1.0 / float(half_life_weeks))
 
-    centered = arr - np.mean(arr, axis=0, keepdims=True)
-    init_n = min(12, n_obs)
-    if n_assets == 1:
-        cov_t = np.array([[float(np.var(centered[:init_n, 0], ddof=1 if init_n > 1 else 0))]])
+    if mean_mode == "zero":
+        r0 = arr[0:1].T
+        s_mat = r0 @ r0.T
+        w_sum = 1.0
+        for i in range(1, n_obs):
+            decay = lam ** float(dt_weeks[i - 1])
+            ri = arr[i : i + 1].T
+            s_mat = decay * s_mat + (ri @ ri.T)
+            w_sum = decay * w_sum + 1.0
+        cov_t = s_mat / w_sum
     else:
-        cov_t = np.cov(centered[:init_n], rowvar=False, ddof=1 if init_n > 1 else 0)
-        cov_t = np.atleast_2d(cov_t)
+        # Strictly causal recursive mean: innovation at step i uses mean estimated from 0..i-1 only
+        m_vec = arr[0].copy()
+        w_m = 1.0
+        s_mat = np.zeros((n_assets, n_assets), dtype=float)
+        w_c = 0.0
+        for i in range(1, n_obs):
+            decay = lam ** float(dt_weeks[i - 1])
+            mu_prev = m_vec / w_m
+            innov = (arr[i] - mu_prev).reshape(n_assets, 1)
+            s_mat = decay * s_mat + (innov @ innov.T)
+            w_c = decay * w_c + 1.0
+            m_vec = decay * m_vec + arr[i]
+            w_m = decay * w_m + 1.0
+        cov_t = s_mat / w_c
 
-    for i in range(init_n, n_obs):
-        r = centered[i : i + 1].T
-        cov_t = lam * cov_t + (1.0 - lam) * (r @ r.T)
-
+    cov_t = 0.5 * (cov_t + cov_t.T)
     cov_ann = cov_t * float(annualization_factor)
     return pd.DataFrame(cov_ann, index=df.columns, columns=df.columns, dtype=float)
 
@@ -234,6 +295,13 @@ def estimate_risk_model(
     tickers = list(returns.columns)
     warnings_list = list(weekly_bundle.warnings)
 
+    last_closed_str = (
+        weekly_bundle.last_closed_friday.date().isoformat()
+        if weekly_bundle.last_closed_friday is not None
+        else None
+    )
+    incomplete_bins = list(weekly_bundle.excluded_incomplete_week_bins)
+
     if cfg.covariance_estimator == "static_shrinkage":
         cov_raw, shrink = shrinkage_covariance_weekly(returns, method=cfg.shrinkage_method)
         cov_psd, psd_adj, min_b, min_a = ensure_psd_covariance(cov_raw)
@@ -258,6 +326,8 @@ def estimate_risk_model(
             min_eigenvalue_before=min_b,
             min_eigenvalue_after=min_a,
             excluded_dates_count=weekly_bundle.excluded_dates_count,
+            excluded_incomplete_week_bins=incomplete_bins,
+            last_closed_friday=last_closed_str,
             missing_weeks_by_asset=dict(weekly_bundle.missing_weeks_by_asset),
             duplicate_dates_removed=dict(weekly_bundle.duplicate_dates_removed),
             proxies_used=dict(proxies_used or {}),
@@ -266,7 +336,12 @@ def estimate_risk_model(
         )
 
     if cfg.covariance_estimator == "ewma":
-        cov_raw = ewma_covariance_weekly(returns, half_life_weeks=cfg.ewma_half_life_weeks)
+        cov_raw = ewma_covariance_weekly(
+            returns,
+            half_life_weeks=cfg.ewma_half_life_weeks,
+            mean_mode=cfg.ewma_mean_mode,
+            gap_policy=cfg.ewma_gap_policy,
+        )
         cov_psd, psd_adj, min_b, min_a = ensure_psd_covariance(cov_raw)
         if psd_adj:
             warnings_list.append(
@@ -279,7 +354,7 @@ def estimate_risk_model(
             corr_matrix=corr_df,
             annualized_volatilities=vols,
             weekly_returns=returns,
-            estimator_name=f"ewma(half_life={cfg.ewma_half_life_weeks:g}w)",
+            estimator_name=f"ewma(half_life={cfg.ewma_half_life_weeks:g}w,mean={cfg.ewma_mean_mode})",
             shrinkage_method="none",
             total_weekly_samples=len(returns),
             start_date=weekly_bundle.start_date,
@@ -288,6 +363,8 @@ def estimate_risk_model(
             min_eigenvalue_before=min_b,
             min_eigenvalue_after=min_a,
             excluded_dates_count=weekly_bundle.excluded_dates_count,
+            excluded_incomplete_week_bins=incomplete_bins,
+            last_closed_friday=last_closed_str,
             missing_weeks_by_asset=dict(weekly_bundle.missing_weeks_by_asset),
             duplicate_dates_removed=dict(weekly_bundle.duplicate_dates_removed),
             proxies_used=dict(proxies_used or {}),
@@ -416,6 +493,8 @@ def estimate_risk_model(
             min_eigenvalue_before=min_b,
             min_eigenvalue_after=min_a,
             excluded_dates_count=weekly_bundle.excluded_dates_count,
+            excluded_incomplete_week_bins=incomplete_bins,
+            last_closed_friday=last_closed_str,
             missing_weeks_by_asset=dict(weekly_bundle.missing_weeks_by_asset),
             duplicate_dates_removed=dict(weekly_bundle.duplicate_dates_removed),
             proxies_used=dict(proxies_used or {}),
@@ -465,6 +544,8 @@ def estimate_risk_model(
         min_eigenvalue_before=min_b,
         min_eigenvalue_after=min_a,
         excluded_dates_count=weekly_bundle.excluded_dates_count,
+        excluded_incomplete_week_bins=incomplete_bins,
+        last_closed_friday=last_closed_str,
         missing_weeks_by_asset=dict(weekly_bundle.missing_weeks_by_asset),
         duplicate_dates_removed=dict(weekly_bundle.duplicate_dates_removed),
         proxies_used=dict(proxies_used or {}),
