@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfolio-optimization"
+version = "0.1.0"
+description = "Faithful Python package migration of the Portfolio Optimization & ML Projection notebook."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "requests",
+    "urllib3",
+    "beautifulsoup4",
+    "yfinance",
+    "xgboost",
+    "scikit-learn",
+    "scipy",
+    "tqdm",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+notebook = [
+    "ipython",
+    "ipywidgets",
+    "plotly",
+    "feedparser",
+    "tkhtmlview",
+]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
