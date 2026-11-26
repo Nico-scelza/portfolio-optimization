@@ -230,6 +230,50 @@ def _normalize_datetime_index(
     return dt_idx.as_unit("ns")
 
 
+def _index_is_tz_aware(index: pd.Index) -> bool:
+    """Return True if ``index`` is (or parses as) a timezone-aware ``DatetimeIndex``."""
+    if isinstance(index, pd.DatetimeIndex):
+        return index.tz is not None
+    if len(index) == 0:
+        return False
+    try:
+        dt_idx = pd.to_datetime(index)
+        return isinstance(dt_idx, pd.DatetimeIndex) and dt_idx.tz is not None
+    except Exception:
+        return False
+
+
+def _normalize_yfinance_daily_index(series: pd.Series) -> pd.Series:
+    """Preserve exchange trading calendar dates for yfinance daily exchange-midnight bars (NEW-04).
+
+    Daily OHLCV history from yfinance stamps every bar at ``00:00:00`` in the exchange's local
+    timezone (e.g. ``America/New_York``, ``Europe/London``, ``Asia/Tokyo``, ``America/Chicago``).
+    Converting those dummy midnights as UTC/NY instants causes:
+    - Positive-offset exchanges (London/Europe/Tokyo) to shift backward by 1 calendar day,
+      leaking Friday closes into Thursday ``as_of_date`` cutoffs and misaligning daily FX.
+    - Negative-offset exchanges (US/NY) to become ``04:00``/``05:00`` naive UTC timestamps,
+      wrongfully excluding completed Fridays under ``as_of_date=None``.
+
+    Only localizes away the exchange tz when ALL timestamps are exact local midnight in their
+    original timezone; true intraday tz-aware series (including live market-hours last bars)
+    are returned untouched for exact ``ZoneInfo`` conversion.
+    """
+    if series is None or series.empty:
+        return series
+    try:
+        dt_idx = pd.to_datetime(series.index)
+    except Exception:
+        return series
+    if isinstance(dt_idx, pd.DatetimeIndex) and dt_idx.tz is not None:
+        if bool((dt_idx == dt_idx.normalize()).all()):
+            return pd.Series(
+                series.to_numpy(),
+                index=dt_idx.tz_localize(None).as_unit("ns"),
+                name=series.name,
+            )
+    return series
+
+
 _ISO_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -313,12 +357,14 @@ def sanitize_price_series(
     target_tz: Optional[str] = None,
     as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
     require_positive: bool = True,
+    strip_tz: bool = True,
 ) -> SanitizedSeriesResult:
     """Sort series chronologically ascending, handle duplicate dates, and filter invalid values."""
     if series is None or len(series) == 0:
         return SanitizedSeriesResult(series=pd.Series(dtype=float, name=asset_id or None))
 
-    s = pd.Series(series.values, index=_normalize_datetime_index(series.index, target_tz=target_tz, strip_tz=True), name=series.name or asset_id)
+    norm_idx = _normalize_datetime_index(series.index, target_tz=target_tz, strip_tz=strip_tz)
+    s = pd.Series(series.values, index=norm_idx, name=series.name or asset_id)
     s = pd.to_numeric(s, errors="coerce")
 
     was_reordered = not s.index.is_monotonic_increasing
@@ -329,7 +375,21 @@ def sanitize_price_series(
         cutoff_ts, cutoff_is_date_only = _resolve_cutoff_timestamp(as_of_cutoff, target_tz=target_tz)
         if cutoff_is_date_only and cutoff_ts == cutoff_ts.normalize():
             cutoff_ts = (cutoff_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
-        s = s[s.index <= cutoff_ts]
+        if s.index.tz is not None:
+            raw_cut_utc: Optional[pd.Timestamp] = None
+            if not (isinstance(as_of_cutoff, date) and not isinstance(as_of_cutoff, datetime)):
+                try:
+                    cand_ts = pd.Timestamp(as_of_cutoff)
+                    if cand_ts.tz is not None:
+                        raw_cut_utc = cand_ts.tz_convert("UTC").as_unit("ns")
+                except Exception:
+                    raw_cut_utc = None
+            if raw_cut_utc is not None:
+                s = s[s.index.tz_convert("UTC") <= raw_cut_utc]
+            else:
+                s = s[s.index.tz_localize(None) <= cutoff_ts]
+        else:
+            s = s[s.index <= cutoff_ts]
 
     if require_positive:
         valid_mask = np.isfinite(s.to_numpy(dtype=float, na_value=np.nan)) & (s.to_numpy(dtype=float, na_value=np.nan) > 0.0)
@@ -367,9 +427,21 @@ def convert_price_series_to_usd(
     fx_max_staleness_days: int = 5,
     min_fx_coverage: float = 0.95,
     duplicate_date_policy: str = "last",
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
+    target_tz: Optional[str] = None,
 ) -> Tuple[pd.Series, FXConversionDiagnostics]:
-    """Convert an asset price series into USD with strict causality and pandas 3.x compatibility."""
+    """Convert an asset price series into USD with strict causality and pandas 3.x compatibility.
+
+    Timezone contract (NEW-04):
+    - If ``target_tz`` is specified (e.g. ``cfg.risk.weekly_cutoff_tz``), tz-aware inputs are
+      converted via ``ZoneInfo(target_tz)`` to naive wall-clock timestamps in ``target_tz``
+      (aligning ``merge_asof`` on exact UTC instants when both ``prices`` and ``fx_rates`` are
+      tz-aware to avoid DST fall-back ambiguity).
+    - If ``target_tz`` is ``None`` and ``prices`` has a tz-aware index, the returned series
+      preserves timezone awareness in ``UTC`` (``datetime64[ns, UTC]``) instead of stripping
+      the timezone to naive UTC wall-clock times.
+    - Tz-naive inputs remain tz-naive ``datetime64[ns]``.
+    """
     raw_ccy = str(currency or "").strip()
     if not raw_ccy:
         raise FXConversionError(
@@ -377,12 +449,21 @@ def convert_price_series_to_usd(
             asset_id=asset_id,
         )
 
+    prices_tz_aware = _index_is_tz_aware(prices.index) if prices is not None and len(prices) > 0 else False
+    fx_tz_aware = _index_is_tz_aware(fx_rates.index) if fx_rates is not None and len(fx_rates) > 0 else False
+
+    preserve_utc_output = prices_tz_aware and target_tz is None
+    align_both_utc = (raw_ccy.upper() != "USD") and prices_tz_aware and fx_tz_aware
+    keep_price_tz = preserve_utc_output or align_both_utc
+
     sanitized_prices = sanitize_price_series(
         prices,
         asset_id=asset_id,
         duplicate_date_policy=duplicate_date_policy,
+        target_tz=target_tz,
         as_of_cutoff=as_of_cutoff,
         require_positive=True,
+        strip_tz=not keep_price_tz,
     )
     clean_prices = sanitized_prices.series
     if clean_prices.empty:
@@ -426,8 +507,10 @@ def convert_price_series_to_usd(
         fx_rates,
         asset_id=fx_symbol,
         duplicate_date_policy=duplicate_date_policy,
+        target_tz=target_tz,
         as_of_cutoff=as_of_cutoff,
         require_positive=True,
+        strip_tz=not align_both_utc,
     )
     clean_fx = sanitized_fx.series
     if clean_fx.empty:
@@ -437,8 +520,22 @@ def convert_price_series_to_usd(
             details={"currency": raw_ccy, "fx_symbol": fx_symbol},
         )
 
-    price_df = pd.DataFrame({"ts": clean_prices.index, "price": clean_prices.to_numpy(dtype=float)})
-    fx_df = pd.DataFrame({"ts": clean_fx.index, "fx_rate": clean_fx.to_numpy(dtype=float)})
+    if clean_prices.index.tz is not None:
+        price_ts_key = clean_prices.index.tz_convert("UTC").tz_localize(None).as_unit("ns")
+        price_orig_ts = clean_prices.index
+    else:
+        price_ts_key = clean_prices.index.as_unit("ns")
+        price_orig_ts = None
+
+    if clean_fx.index.tz is not None:
+        fx_ts_key = clean_fx.index.tz_convert("UTC").tz_localize(None).as_unit("ns")
+    else:
+        fx_ts_key = clean_fx.index.as_unit("ns")
+
+    price_df = pd.DataFrame({"ts": price_ts_key, "price": clean_prices.to_numpy(dtype=float)})
+    if price_orig_ts is not None:
+        price_df["orig_ts"] = price_orig_ts
+    fx_df = pd.DataFrame({"ts": fx_ts_key, "fx_rate": clean_fx.to_numpy(dtype=float)})
 
     price_df["ts"] = price_df["ts"].astype("datetime64[ns]")
     fx_df["ts"] = fx_df["ts"].astype("datetime64[ns]")
@@ -482,9 +579,18 @@ def convert_price_series_to_usd(
     else:
         converted = scaled_prices / valid_rows["fx_rate"]
 
+    if price_orig_ts is not None:
+        orig_dt_idx = pd.DatetimeIndex(valid_rows["orig_ts"])
+        if target_tz is not None:
+            result_index = orig_dt_idx.tz_convert(ZoneInfo(target_tz)).tz_localize(None).as_unit("ns")
+        else:
+            result_index = orig_dt_idx.tz_convert("UTC").as_unit("ns")
+    else:
+        result_index = pd.DatetimeIndex(valid_rows["ts"]).as_unit("ns")
+
     result_series = pd.Series(
         converted.to_numpy(dtype=float),
-        index=pd.DatetimeIndex(valid_rows["ts"]),
+        index=result_index,
         name=asset_id,
     )
     diag = FXConversionDiagnostics(
@@ -547,7 +653,8 @@ def _download_prices(
     min_fx_coverage: float = 0.95,
     duplicate_date_policy: str = "last",
     currency_overrides: Optional[Dict[str, Optional[str]]] = None,
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
+    target_tz: Optional[str] = None,
     fx_fetcher: Optional[Callable[[str, str], pd.Series]] = None,
     allow_partial: bool = False,
     errors_out: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -605,7 +712,7 @@ def _download_prices(
                     asset_id=ticker_upper,
                     details={"ticker": ticker, "period": period},
                 )
-            raw_series = _extract_close_series(hist)
+            raw_series = _normalize_yfinance_daily_index(_extract_close_series(hist))
             if raw_series.empty:
                 raise InsufficientHistoryError(
                     f"Provider returned historical table without usable Close/Adj Close column for '{ticker_upper}'.",
@@ -618,7 +725,7 @@ def _download_prices(
             if spec is not None:
                 fx_sym = spec[0]
                 if fx_sym not in fx_cache:
-                    fx_cache[fx_sym] = fetcher(fx_sym, period)
+                    fx_cache[fx_sym] = _normalize_yfinance_daily_index(fetcher(fx_sym, period))
                 fx_series = fx_cache[fx_sym]
 
             usd_series, diag = convert_price_series_to_usd(
@@ -630,6 +737,7 @@ def _download_prices(
                 min_fx_coverage=min_fx_coverage,
                 duplicate_date_policy=duplicate_date_policy,
                 as_of_cutoff=as_of_cutoff,
+                target_tz=target_tz,
             )
             diag.economic_currency = econ_currency
             diag.warnings.extend(ccy_warnings)
@@ -640,7 +748,7 @@ def _download_prices(
             if unadjusted_close_out is not None:
                 try:
                     hist_unadj = ticker_obj.history(period=period, auto_adjust=False)
-                    raw_unadj = _extract_unadjusted_close_series(hist_unadj)
+                    raw_unadj = _normalize_yfinance_daily_index(_extract_unadjusted_close_series(hist_unadj))
                     if not raw_unadj.empty:
                         unadj_usd, _ = convert_price_series_to_usd(
                             asset_id=ticker_upper,
@@ -651,6 +759,7 @@ def _download_prices(
                             min_fx_coverage=min_fx_coverage,
                             duplicate_date_policy=duplicate_date_policy,
                             as_of_cutoff=as_of_cutoff,
+                            target_tz=target_tz,
                         )
                         unadjusted_close_out[ticker_upper] = unadj_usd
                 except Exception:
@@ -667,6 +776,18 @@ def _download_prices(
 
     if not series_map:
         return pd.DataFrame(), dropped
+
+    has_tz_aware = any(isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None for s in series_map.values())
+    has_tz_naive = any(isinstance(s.index, pd.DatetimeIndex) and s.index.tz is None for s in series_map.values())
+    if has_tz_aware and has_tz_naive:
+        series_map = {
+            k: pd.Series(
+                s.to_numpy(dtype=float),
+                index=_normalize_datetime_index(s.index, target_tz=target_tz, strip_tz=True),
+                name=s.name,
+            )
+            for k, s in series_map.items()
+        }
 
     prices_usd = pd.DataFrame(series_map).sort_index(ascending=True)
     prices_usd = prices_usd.dropna(how="all")
@@ -921,18 +1042,20 @@ def compute_weekly_returns_w_fri(
 def fetch_vix_history(
     period: str = "10y",
     *,
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
+    target_tz: Optional[str] = None,
 ) -> pd.Series:
     """Download historical daily ^VIX close observations sorted chronologically ascending."""
     vix = yf.Ticker("^VIX")
     hist = vix.history(period=period, auto_adjust=False)
     if hist is None or hist.empty:
         return pd.Series(dtype=float, name="^VIX")
-    raw = _extract_close_series(hist)
+    raw = _normalize_yfinance_daily_index(_extract_close_series(hist))
     san = sanitize_price_series(
         raw,
         asset_id="^VIX",
         duplicate_date_policy="last",
+        target_tz=target_tz,
         as_of_cutoff=as_of_cutoff,
         require_positive=True,
     )
@@ -944,17 +1067,24 @@ def get_current_vix_observation(
     vix_history: Optional[pd.Series] = None,
     as_of_date: Optional[date] = None,
     max_staleness_days: int = 7,
+    target_tz: Optional[str] = None,
 ) -> Tuple[Optional[float], Optional[pd.Timestamp], bool]:
     """Return ``(vix_value, observation_timestamp, is_stale)`` using strictly causal data."""
     cutoff = pd.Timestamp(as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1) if as_of_date else None
     series = vix_history
     if series is None:
         try:
-            series = fetch_vix_history(period="1mo", as_of_cutoff=cutoff)
+            series = fetch_vix_history(period="1mo", as_of_cutoff=cutoff, target_tz=target_tz)
         except Exception:
             return None, None, True
     else:
-        san = sanitize_price_series(series, asset_id="^VIX", as_of_cutoff=cutoff, require_positive=True)
+        san = sanitize_price_series(
+            _normalize_yfinance_daily_index(series),
+            asset_id="^VIX",
+            target_tz=target_tz,
+            as_of_cutoff=cutoff,
+            require_positive=True,
+        )
         series = san.series
 
     if series is None or series.empty:
@@ -1032,7 +1162,8 @@ def descargar_precios_historicos(
     fx_max_staleness_days: int = 5,
     min_fx_coverage: float = 0.95,
     currency_overrides: Optional[Dict[str, Optional[str]]] = None,
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
+    target_tz: Optional[str] = None,
     fx_fetcher: Optional[Callable[[str, str], pd.Series]] = None,
     allow_partial: bool = False,
 ) -> pd.DataFrame:
@@ -1044,6 +1175,7 @@ def descargar_precios_historicos(
         min_fx_coverage=min_fx_coverage,
         currency_overrides=currency_overrides,
         as_of_cutoff=as_of_cutoff,
+        target_tz=target_tz,
         fx_fetcher=fx_fetcher,
         allow_partial=allow_partial,
     )
