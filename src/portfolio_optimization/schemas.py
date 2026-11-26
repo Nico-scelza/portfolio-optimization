@@ -89,6 +89,12 @@ VALID_PRIOR_POLICIES = (
 VALID_FI_BL_MODES = ("metric_only", "explicit_ytm_view")
 VALID_DCF_BASES = ("terminal_target", "present_intrinsic_value", "dated_cashflows")
 VALID_HRP_LINKAGES = ("single", "complete", "average", "ward")
+VALID_NON_POSITIVE_EXCESS_POLICIES = ("block", "allow_with_warning")
+VALID_ACCRUED_BASES = ("quote_convention", "per_reference_nominal", "per_1_original_nominal")
+VALID_HISTORICAL_PRICE_TYPES = ("market_price", "adjusted_total_return")
+VALID_EWMA_MEAN_MODES = ("zero", "causal_recursive")
+VALID_EWMA_GAP_POLICIES = ("elapsed_weeks_decay", "error_on_gap")
+SUBUNIT_CURRENCY_CODES = frozenset({"GBp", "GBX", "ZAc", "ZAC", "ILA", "ILX"})
 
 # Removed legacy concepts that must never be silently accepted
 REMOVED_LEGACY_KEYS = frozenset({
@@ -340,6 +346,7 @@ class FixedIncomeTerms:
     price_convention: str = "per_100_original_nominal"
     price_type: str = "dirty"
     accrued_interest: Optional[float] = None
+    accrued_interest_basis: str = "quote_convention"
     coupon_structure: str = "fixed"
     day_count_convention: Optional[str] = "ACT/365"
     coupon_frequency: Optional[int] = None
@@ -422,6 +429,10 @@ class FixedIncomeTerms:
             if acc < 0.0:
                 raise FixedIncomeValidationError("'accrued_interest' must be >= 0.")
             object.__setattr__(self, "accrued_interest", acc)
+        if self.accrued_interest_basis not in VALID_ACCRUED_BASES:
+            raise FixedIncomeValidationError(
+                f"Invalid accrued_interest_basis '{self.accrued_interest_basis}'. Expected one of {VALID_ACCRUED_BASES}."
+            )
 
         if self.cashflow_fx_to_usd is not None:
             fx = _check_finite(self.cashflow_fx_to_usd, "cashflow_fx_to_usd")
@@ -469,7 +480,7 @@ class DCFViewConfig:
     """
 
     valuation_basis: str = "terminal_target"
-    horizon_years: float = 5.0
+    horizon_years: Optional[float] = None
     confidence: Optional[float] = None
     target_price: Optional[float] = None
     present_intrinsic_value: Optional[float] = None
@@ -484,10 +495,11 @@ class DCFViewConfig:
             raise ConfigurationError(
                 f"Invalid DCF valuation_basis '{self.valuation_basis}'. Expected one of {VALID_DCF_BASES}."
             )
-        horizon = _check_finite(self.horizon_years, "horizon_years")
-        if horizon <= 0.0:
-            raise ConfigurationError("'horizon_years' must be strictly positive.")
-        object.__setattr__(self, "horizon_years", horizon)
+        if self.horizon_years is not None:
+            horizon = _check_finite(self.horizon_years, "horizon_years")
+            if horizon <= 0.0:
+                raise ConfigurationError("'horizon_years' must be strictly positive.")
+            object.__setattr__(self, "horizon_years", horizon)
 
         if self.confidence is not None:
             conf = _check_finite(self.confidence, "confidence")
@@ -556,7 +568,18 @@ class DCFViewConfig:
 
 @dataclass(frozen=True)
 class InstrumentConfig:
-    """Unique economic instrument definition independent of broker holdings."""
+    """Unique economic instrument definition independent of broker holdings.
+
+    Currency & units contract:
+    - ``currency`` defaults to ``None`` (auto-detect quote currency and subunit scale
+      from the market data provider without overriding provider metadata to ``"USD"``).
+      Provide an explicit value ONLY as a verified economic/quote currency override.
+    - For individual debt (``sovereign_bond``, ``corporate_bond_on``, ``tbill``),
+      ``BrokerPosition.quantity``, ``ProposedOrder.quantity``, ``min_nominal``, and
+      ``lot_size`` are expressed in **original nominal units (1 VN original)**.
+    - For equities, ETFs (including ``fixed_income_etf``), gold/commodities, and crypto,
+      quantities are expressed in **shares / units**.
+    """
 
     instrument_id: str
     ticker: str
@@ -564,7 +587,9 @@ class InstrumentConfig:
     asset_subtype: str = "equity"
     risk_class: Optional[str] = None
     quote_source: str = "yfinance"
-    currency: str = "USD"
+    currency: Optional[str] = None
+    quote_unit: Optional[str] = None
+    historical_price_series_type: str = "market_price"
     market: str = "US"
     country: Optional[str] = None  # Descriptive/calendar metadata only, never country-risk spread
     exchange: Optional[str] = None
@@ -626,13 +651,33 @@ class InstrumentConfig:
                 asset_id=iid,
             )
 
-        # Preserve case for subunit currencies like GBp / ZAc; normalize standard 3-letter codes
-        raw_ccy = str(self.currency or "USD").strip()
-        if raw_ccy in ("GBp", "ZAc"):
-            norm_ccy = raw_ccy
+        # Preserve case for subunit currencies like GBp/GBX/ZAc/ZAC/ILA/ILX; keep None as auto-detect
+        if self.currency is None or not str(self.currency).strip():
+            norm_ccy: Optional[str] = None
         else:
-            norm_ccy = raw_ccy.upper()
+            raw_ccy = str(self.currency).strip()
+            if raw_ccy in SUBUNIT_CURRENCY_CODES:
+                norm_ccy = raw_ccy
+            else:
+                norm_ccy = raw_ccy.upper()
         object.__setattr__(self, "currency", norm_ccy)
+
+        if self.quote_unit is not None:
+            qu = str(self.quote_unit).strip()
+            if qu not in VALID_PRICE_CONVENTIONS:
+                raise ConfigurationError(
+                    f"Instrument '{iid}': invalid quote_unit '{qu}'. Expected one of {VALID_PRICE_CONVENTIONS}.",
+                    asset_id=iid,
+                )
+            object.__setattr__(self, "quote_unit", qu)
+
+        if self.historical_price_series_type not in VALID_HISTORICAL_PRICE_TYPES:
+            raise ConfigurationError(
+                f"Instrument '{iid}': invalid historical_price_series_type '{self.historical_price_series_type}'. "
+                f"Expected one of {VALID_HISTORICAL_PRICE_TYPES}.",
+                asset_id=iid,
+            )
+
         object.__setattr__(self, "market", str(self.market or "US").strip().upper())
 
         if self.lot_size is not None:
@@ -927,6 +972,8 @@ class RiskModelConfig:
     covariance_estimator: str = "vix_regime"
     shrinkage_method: str = "ledoit_wolf"
     ewma_half_life_weeks: float = 26.0
+    ewma_mean_mode: str = "zero"
+    ewma_gap_policy: str = "elapsed_weeks_decay"
     allow_explicit_proxies: bool = False
     vix_regime: VixRegimeConfig = field(default_factory=VixRegimeConfig)
 
@@ -958,6 +1005,14 @@ class RiskModelConfig:
         hl = _check_finite(self.ewma_half_life_weeks, "ewma_half_life_weeks")
         if hl <= 0.0:
             raise ConfigurationError("'ewma_half_life_weeks' must be > 0.")
+        if self.ewma_mean_mode not in VALID_EWMA_MEAN_MODES:
+            raise ConfigurationError(
+                f"Invalid ewma_mean_mode '{self.ewma_mean_mode}'. Expected one of {VALID_EWMA_MEAN_MODES}."
+            )
+        if self.ewma_gap_policy not in VALID_EWMA_GAP_POLICIES:
+            raise ConfigurationError(
+                f"Invalid ewma_gap_policy '{self.ewma_gap_policy}'. Expected one of {VALID_EWMA_GAP_POLICIES}."
+            )
 
         vr = self.vix_regime if isinstance(self.vix_regime, VixRegimeConfig) else VixRegimeConfig.from_dict(self.vix_regime)
         object.__setattr__(self, "min_fx_coverage", mfc)
@@ -1078,8 +1133,7 @@ class OptimizationConfig:
     strategies_to_run: Tuple[str, ...] = VALID_STRATEGIES
     hrp_linkage_method: str = "single"
     cvar_confidence: float = 0.95
-    simulation_samples: int = 2000
-    random_seed: Optional[int] = 42
+    non_positive_excess_return_policy: str = "block"
     include_stress_tests: bool = True
 
     def __post_init__(self) -> None:
@@ -1102,8 +1156,11 @@ class OptimizationConfig:
         conf = _check_finite(self.cvar_confidence, "cvar_confidence")
         if conf <= 0.5 or conf >= 1.0:
             raise ConfigurationError("'cvar_confidence' must be in (0.5, 1.0).")
-        if self.simulation_samples < 0:
-            raise ConfigurationError("'simulation_samples' must be >= 0.")
+        if self.non_positive_excess_return_policy not in VALID_NON_POSITIVE_EXCESS_POLICIES:
+            raise ConfigurationError(
+                f"Invalid non_positive_excess_return_policy '{self.non_positive_excess_return_policy}'. "
+                f"Expected one of {VALID_NON_POSITIVE_EXCESS_POLICIES}."
+            )
 
         object.__setattr__(self, "strategies_to_run", strats)
         object.__setattr__(self, "cvar_confidence", conf)
@@ -1114,6 +1171,12 @@ class OptimizationConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OptimizationConfig":
         payload = dict(data)
+        removed = {"simulation_samples", "random_seed"}.intersection(payload.keys())
+        if removed:
+            raise ConfigurationError(
+                f"Removed decorative OptimizationConfig field(s) are no longer supported: {sorted(removed)} "
+                "(this engine uses deterministic optimization with no Monte Carlo simulation)."
+            )
         if "strategies_to_run" in payload and payload["strategies_to_run"] is not None:
             payload["strategies_to_run"] = tuple(payload["strategies_to_run"])
         return cls(**payload)
@@ -1121,13 +1184,16 @@ class OptimizationConfig:
 
 @dataclass(frozen=True)
 class RebalancingConfig:
-    """Editable fractional rebalancing thresholds and cash-flow settings.
+    """Editable fractional rebalancing thresholds and segregated broker cash settings.
 
     Rule:
-        When both thresholds are enabled, a trade is executed ONLY if
+        When both thresholds are enabled, a trade is eligible ONLY if
         ``abs(target_weight - current_weight) >= min_weight_diff`` AND
         ``gross_notional_usd >= min_notional_usd`` (using ``threshold_comparison``).
-        Either criterion can be disabled independently.
+        Cash is strictly segregated per broker: scalar ``available_cash_usd`` and
+        ``cash_flow_usd`` are valid only for single-broker portfolios (or when 0.0).
+        Multi-broker setups MUST assign non-zero cash/flows via
+        ``available_cash_by_broker`` and ``cash_flow_by_broker``.
     """
 
     min_weight_diff: Optional[float] = 0.01  # 1 percentage point (absolute weight difference)
@@ -1137,6 +1203,8 @@ class RebalancingConfig:
     threshold_comparison: str = ">="
     available_cash_usd: float = 0.0
     cash_flow_usd: float = 0.0
+    available_cash_by_broker: Dict[str, float] = field(default_factory=dict)
+    cash_flow_by_broker: Dict[str, float] = field(default_factory=dict)
     enforce_hard_bounds_after_rebalance: bool = True
 
     def __post_init__(self) -> None:
@@ -1156,8 +1224,29 @@ class RebalancingConfig:
         if cash < 0.0:
             raise ConfigurationError("'available_cash_usd' must be >= 0.")
         cf = _check_finite(self.cash_flow_usd, "cash_flow_usd")
+
+        clean_cash_by_broker: Dict[str, float] = {}
+        for bid, val in (self.available_cash_by_broker or {}).items():
+            key = str(bid).strip()
+            if not key:
+                raise ConfigurationError("available_cash_by_broker keys must be non-empty broker IDs.")
+            fval = _check_finite(val, f"available_cash_by_broker[{key}]")
+            if fval < 0.0:
+                raise ConfigurationError(f"available_cash_by_broker['{key}'] must be >= 0.")
+            clean_cash_by_broker[key] = fval
+
+        clean_flow_by_broker: Dict[str, float] = {}
+        for bid, val in (self.cash_flow_by_broker or {}).items():
+            key = str(bid).strip()
+            if not key:
+                raise ConfigurationError("cash_flow_by_broker keys must be non-empty broker IDs.")
+            fval = _check_finite(val, f"cash_flow_by_broker[{key}]")
+            clean_flow_by_broker[key] = fval
+
         object.__setattr__(self, "available_cash_usd", cash)
         object.__setattr__(self, "cash_flow_usd", cf)
+        object.__setattr__(self, "available_cash_by_broker", clean_cash_by_broker)
+        object.__setattr__(self, "cash_flow_by_broker", clean_flow_by_broker)
 
     def to_dict(self) -> Dict[str, Any]:
         return _serialize_value(asdict(self))
@@ -1175,6 +1264,11 @@ class IOLConfig:
     ons_url: str = "https://iol.invertironline.com/mercado/cotizaciones/argentina/obligaciones-negociables/todos"
     timeout_seconds: float = 15.0
     max_mep_time_skew_seconds: float = 300.0
+    max_mep_market_time_diff_seconds: float = 3600.0
+    max_mep_quote_age_seconds: Optional[float] = None
+    allow_mep_without_market_timestamp: bool = False
+    mep_plausible_min: float = 50.0
+    mep_plausible_max: float = 50000.0
     low_liquidity_amount_threshold: float = 1000.0
     wide_spread_bps_threshold: float = 300.0
     min_valid_rows: int = 1
@@ -1186,6 +1280,20 @@ class IOLConfig:
         skew = _check_finite(self.max_mep_time_skew_seconds, "max_mep_time_skew_seconds")
         if skew < 0.0:
             raise ConfigurationError("'max_mep_time_skew_seconds' must be >= 0.")
+        mkt_diff = _check_finite(self.max_mep_market_time_diff_seconds, "max_mep_market_time_diff_seconds")
+        if mkt_diff < 0.0:
+            raise ConfigurationError("'max_mep_market_time_diff_seconds' must be >= 0.")
+        if self.max_mep_quote_age_seconds is not None:
+            age = _check_finite(self.max_mep_quote_age_seconds, "max_mep_quote_age_seconds")
+            if age < 0.0:
+                raise ConfigurationError("'max_mep_quote_age_seconds' must be >= 0.")
+            object.__setattr__(self, "max_mep_quote_age_seconds", age)
+        m_min = _check_finite(self.mep_plausible_min, "mep_plausible_min")
+        m_max = _check_finite(self.mep_plausible_max, "mep_plausible_max")
+        if m_min <= 0.0 or m_max <= m_min:
+            raise ConfigurationError(
+                f"MEP plausible bounds must satisfy 0 < mep_plausible_min ({m_min}) < mep_plausible_max ({m_max})."
+            )
         liq = _check_finite(self.low_liquidity_amount_threshold, "low_liquidity_amount_threshold")
         if liq < 0.0:
             raise ConfigurationError("'low_liquidity_amount_threshold' must be >= 0.")
@@ -1197,6 +1305,9 @@ class IOLConfig:
 
         object.__setattr__(self, "timeout_seconds", t)
         object.__setattr__(self, "max_mep_time_skew_seconds", skew)
+        object.__setattr__(self, "max_mep_market_time_diff_seconds", mkt_diff)
+        object.__setattr__(self, "mep_plausible_min", m_min)
+        object.__setattr__(self, "mep_plausible_max", m_max)
         object.__setattr__(self, "low_liquidity_amount_threshold", liq)
         object.__setattr__(self, "wide_spread_bps_threshold", sp)
 
@@ -1324,6 +1435,38 @@ class PortfolioAnalysisConfig:
         reb_cfg = self.rebalancing if isinstance(self.rebalancing, RebalancingConfig) else RebalancingConfig.from_dict(self.rebalancing)
         iol_cfg = self.iol if isinstance(self.iol, IOLConfig) else IOLConfig.from_dict(self.iol)
 
+        # Validate per-broker cash / flow assignments against configured brokers (AUD-03)
+        for bid in reb_cfg.available_cash_by_broker:
+            if broker_ids and bid not in broker_ids:
+                raise ConfigurationError(
+                    f"rebalancing.available_cash_by_broker references unknown broker_id '{bid}'."
+                )
+        for bid in reb_cfg.cash_flow_by_broker:
+            if broker_ids and bid not in broker_ids:
+                raise ConfigurationError(
+                    f"rebalancing.cash_flow_by_broker references unknown broker_id '{bid}'."
+                )
+        if len(brokers_tuple) > 1:
+            if abs(reb_cfg.available_cash_usd) > 0.0:
+                raise ConfigurationError(
+                    "Scalar 'rebalancing.available_cash_usd' is ambiguous with multiple brokers; "
+                    "assign non-zero balances explicitly via 'rebalancing.available_cash_by_broker'."
+                )
+            if abs(reb_cfg.cash_flow_usd) > 0.0:
+                raise ConfigurationError(
+                    "Scalar 'rebalancing.cash_flow_usd' is ambiguous with multiple brokers; "
+                    "assign non-zero cash flows explicitly via 'rebalancing.cash_flow_by_broker'."
+                )
+        elif len(brokers_tuple) == 1:
+            if abs(reb_cfg.available_cash_usd) > 0.0 and reb_cfg.available_cash_by_broker:
+                raise ConfigurationError(
+                    "Specify either 'available_cash_usd' or 'available_cash_by_broker', not both, to prevent double-counting."
+                )
+            if abs(reb_cfg.cash_flow_usd) > 0.0 and reb_cfg.cash_flow_by_broker:
+                raise ConfigurationError(
+                    "Specify either 'cash_flow_usd' or 'cash_flow_by_broker', not both, to prevent double-counting."
+                )
+
         as_of = None if self.as_of_date is None else _parse_date(self.as_of_date, "as_of_date")
 
         object.__setattr__(self, "variable_income", vi)
@@ -1429,6 +1572,9 @@ class FixedIncomeMetricsResult:
     accrued_interest: float = 0.0
     dirty_price_per_reference: Optional[float] = None
     dirty_price_usd: Optional[float] = None
+    dirty_price_usd_per_original_nominal: Optional[float] = None
+    quote_source_used: Optional[str] = None
+    valuation_price_date: Optional[str] = None
     ytm_annual: Optional[float] = None
     macaulay_duration_years: Optional[float] = None
     modified_duration_years: Optional[float] = None
@@ -1543,6 +1689,8 @@ class RiskModelResult:
     min_eigenvalue_before: Optional[float] = None
     min_eigenvalue_after: Optional[float] = None
     excluded_dates_count: int = 0
+    excluded_incomplete_week_bins: List[str] = field(default_factory=list)
+    last_closed_friday: Optional[str] = None
     missing_weeks_by_asset: Dict[str, int] = field(default_factory=dict)
     duplicate_dates_removed: Dict[str, int] = field(default_factory=dict)
     proxies_used: Dict[str, str] = field(default_factory=dict)
@@ -1573,6 +1721,8 @@ class RiskModelResult:
             "min_eigenvalue_before": self.min_eigenvalue_before,
             "min_eigenvalue_after": self.min_eigenvalue_after,
             "excluded_dates_count": self.excluded_dates_count,
+            "excluded_incomplete_week_bins": self.excluded_incomplete_week_bins,
+            "last_closed_friday": self.last_closed_friday,
             "missing_weeks_by_asset": self.missing_weeks_by_asset,
             "duplicate_dates_removed": self.duplicate_dates_removed,
             "proxies_used": self.proxies_used,
@@ -1646,6 +1796,8 @@ class ProposedOrder:
     target_weight: float
     achievable_weight: float
     fractional: bool = True
+    quantity_unit: str = "shares_or_units"
+    quoted_price_usd: Optional[float] = None
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1682,11 +1834,18 @@ class RebalancingResult:
     current_weights: Dict[str, float] = field(default_factory=dict)
     achievable_weights: Dict[str, float] = field(default_factory=dict)
     weight_deviations: Dict[str, float] = field(default_factory=dict)
+    initial_holdings_value_usd: float = 0.0
     initial_portfolio_value_usd: float = 0.0
+    deployable_capital_usd: float = 0.0
     final_portfolio_value_usd: float = 0.0
     initial_cash_usd: float = 0.0
     cash_flow_usd: float = 0.0
     ending_cash_usd: float = 0.0
+    initial_cash_by_broker: Dict[str, float] = field(default_factory=dict)
+    cash_flow_by_broker: Dict[str, float] = field(default_factory=dict)
+    ending_cash_by_broker: Dict[str, float] = field(default_factory=dict)
+    broker_ledgers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    unfunded_buy_shortfall_usd: float = 0.0
     total_buy_gross_usd: float = 0.0
     total_sell_gross_usd: float = 0.0
     total_commission_usd: float = 0.0
