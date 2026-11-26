@@ -277,8 +277,17 @@ def _build_broker_ledgers(
     buy_spread_by_broker: Dict[str, float],
     ending_cash_by_broker: Dict[str, float],
     shortfall_by_broker: Dict[str, float],
+    *,
+    desired_buy_gross_by_broker: Optional[Dict[str, float]] = None,
+    cost_adjusted_buy_reduction_by_broker: Optional[Dict[str, float]] = None,
+    threshold_omitted_buy_by_broker: Optional[Dict[str, float]] = None,
+    lot_rounding_residual_by_broker: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     ledgers: Dict[str, Dict[str, Any]] = {}
+    desired_map = desired_buy_gross_by_broker or {}
+    cost_adj_map = cost_adjusted_buy_reduction_by_broker or {}
+    thresh_map = threshold_omitted_buy_by_broker or {}
+    lot_map = lot_rounding_residual_by_broker or {}
     for bid in broker_ids:
         s_gross = sell_gross_by_broker.get(bid, 0.0)
         s_comm = sell_comm_by_broker.get(bid, 0.0)
@@ -300,12 +309,16 @@ def _build_broker_ledgers(
             "sell_commission_usd": float(s_comm),
             "sell_spread_usd": float(s_spread),
             "sell_net_proceeds_usd": float(s_net),
+            "desired_buy_gross_usd": float(desired_map.get(bid, 0.0)),
             "buy_gross_usd": float(b_gross),
             "buy_commission_usd": float(b_comm),
             "buy_spread_usd": float(b_spread),
             "buy_total_outflow_usd": float(b_out),
             "total_transaction_cost_usd": float(s_comm + s_spread + b_comm + b_spread),
             "ending_cash_usd": float(ending_cash_by_broker.get(bid, 0.0)),
+            "cost_adjusted_buy_reduction_usd": float(cost_adj_map.get(bid, 0.0)),
+            "threshold_omitted_buy_usd": float(thresh_map.get(bid, 0.0)),
+            "lot_rounding_residual_usd": float(lot_map.get(bid, 0.0)),
             "unfunded_buy_shortfall_usd": float(shortfall_by_broker.get(bid, 0.0)),
         }
     return ledgers
@@ -791,7 +804,11 @@ def compute_rebalancing_plan(
     buy_comm_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
     buy_spread_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
     buy_outflow_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
+    desired_buy_gross_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
     shortfall_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
+    cost_adjusted_buy_reduction_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
+    threshold_omitted_buy_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
+    lot_rounding_residual_by_broker: Dict[str, float] = {bid: 0.0 for bid in broker_ids}
 
     buys_by_broker: Dict[str, List[Dict[str, Any]]] = {bid: [] for bid in broker_ids}
     for cand in buy_candidates:
@@ -825,6 +842,13 @@ def compute_rebalancing_plan(
         if not cands_here:
             continue
         broker_avail = avail_cash_by_broker[bid]
+        desired_buy_gross_b = sum(float(c["qty"]) * float(c["price_usd"]) for c in cands_here)
+        desired_buy_gross_by_broker[bid] = desired_buy_gross_b
+        gross_pre_cost_cash_b = initial_cash_by_broker[bid] + cash_flow_by_broker[bid] + sell_gross_by_broker[bid]
+        pre_cost_deficit_b = max(0.0, desired_buy_gross_b - max(gross_pre_cost_cash_b, 0.0))
+        if pre_cost_deficit_b <= 1e-8:
+            pre_cost_deficit_b = 0.0
+
         desired_full_outflow, _ = _eval_scaled_buys(cands_here, 1.0)
 
         if broker_avail <= 1e-8:
@@ -856,14 +880,17 @@ def compute_rebalancing_plan(
                 )
             continue
 
-        # Iterative per-broker cash scaling + post-scaling min_notional_usd revalidation (AUD-03 & AUD-11)
+        # Iterative per-broker cash scaling + post-scaling min_notional_usd revalidation (AUD-03, AUD-11, NEW-02)
         active_cands = list(cands_here)
         final_evals: List[Tuple[Dict[str, Any], float, float, float, float, List[str]]] = []
+        cost_infeasible_omitted_b = 0.0
+        threshold_omitted_b = 0.0
 
         while active_cands:
             full_out, evals = _eval_scaled_buys(active_cands, 1.0)
             chosen_scale = 1.0
             if full_out > broker_avail + 1e-9:
+                # 60 bisection steps achieve scale precision 2^-60 (~8.7e-19), guaranteed monotone convergence.
                 lo, hi = 0.0, 1.0
                 for _ in range(60):
                     mid = 0.5 * (lo + hi)
@@ -883,7 +910,7 @@ def compute_rebalancing_plan(
                 px = float(c["price_usd"])
                 desired_g = float(c["qty"]) * px
                 if q_exec <= 0.0 or gross <= 1e-10:
-                    shortfall_by_broker[bid] += desired_g
+                    cost_infeasible_omitted_b += desired_g
                     omitted.append(
                         OmittedTrade(
                             instrument_id=inst.instrument_id,
@@ -901,7 +928,7 @@ def compute_rebalancing_plan(
                 if cfg.use_notional_threshold and cfg.min_notional_usd is not None and not _passes_threshold(
                     gross, cfg.min_notional_usd, cfg.threshold_comparison
                 ):
-                    shortfall_by_broker[bid] += desired_g
+                    threshold_omitted_b += desired_g
                     omitted.append(
                         OmittedTrade(
                             instrument_id=inst.instrument_id,
@@ -925,22 +952,30 @@ def compute_rebalancing_plan(
                 continue
 
             if chosen_scale < 1.0 - 1e-9:
-                warnings.append(
-                    f"Broker '{bid}': BUY order(s) scaled by {chosen_scale:.4f} to respect segregated broker cash ({broker_avail:.2f} USD) after transaction costs."
-                )
+                if pre_cost_deficit_b > 1e-8:
+                    warnings.append(
+                        f"Broker '{bid}': BUY order(s) scaled by {chosen_scale:.4f} due to segregated broker funding deficit "
+                        f"({pre_cost_deficit_b:.2f} USD pre-cost shortfall) and transaction costs (available net cash: {broker_avail:.2f} USD)."
+                    )
+                else:
+                    warnings.append(
+                        f"Broker '{bid}': BUY order(s) scaled by {chosen_scale:.4f} to absorb broker transaction costs "
+                        f"within available segregated cash ({broker_avail:.2f} USD; pre-cost funding shortfall: 0.00 USD)."
+                    )
             final_evals = [
                 (c, q_exec, gross, comm, spread, op_notes)
                 for c, (q_exec, gross, comm, spread, op_notes) in zip(active_cands, evals)
             ]
             break
 
+        exec_reduction_b = 0.0
         for c, q_exec, gross, comm, spread, op_notes in final_evals:
             inst = c["instrument"]
             px = float(c["price_usd"])
             desired_g = float(c["qty"]) * px
             cash_out = gross + comm + spread
             if buy_outflow_by_broker[bid] + cash_out > broker_avail + 1e-9:
-                shortfall_by_broker[bid] += desired_g
+                cost_infeasible_omitted_b += desired_g
                 omitted.append(
                     OmittedTrade(
                         instrument_id=inst.instrument_id,
@@ -955,8 +990,7 @@ def compute_rebalancing_plan(
                 )
                 continue
 
-            if gross < desired_g - 1e-4:
-                shortfall_by_broker[bid] += max(0.0, desired_g - gross)
+            exec_reduction_b += max(0.0, desired_g - gross)
 
             post_qty_by_inst[inst.instrument_id] += q_exec
             post_pos_by_inst_broker[(inst.instrument_id, bid)] = (
@@ -994,6 +1028,45 @@ def compute_rebalancing_plan(
                     notes=base_notes,
                 )
             )
+
+        # Causal per-broker decomposition of unexecuted buy gross (NEW-02):
+        # Exact identity: desired_buy_gross_b - buy_gross_b
+        #   == (desired_buy_gross_b - gross_pre_cost_cash_b) + total_tx_cost_b + ending_cash_b
+        # Separates real funding shortfall from broker transaction-cost friction, operational
+        # min_notional threshold omissions, and discrete lot rounding residuals.
+        total_unexec_b = max(0.0, desired_buy_gross_b - buy_gross_by_broker[bid])
+        if total_unexec_b <= 1e-10:
+            total_unexec_b = 0.0
+
+        shortfall_b = max(pre_cost_deficit_b, cost_infeasible_omitted_b)
+        if shortfall_b <= 1e-8:
+            shortfall_b = 0.0
+        shortfall_b = min(shortfall_b, total_unexec_b)
+
+        rem_after_shortfall = max(0.0, total_unexec_b - shortfall_b)
+        broker_tx_cost_b = (
+            sell_comm_by_broker[bid]
+            + sell_spread_by_broker[bid]
+            + buy_comm_by_broker[bid]
+            + buy_spread_by_broker[bid]
+        )
+        cost_adj_b = min(exec_reduction_b, rem_after_shortfall, broker_tx_cost_b)
+        if cost_adj_b <= 1e-10:
+            cost_adj_b = 0.0
+
+        rem_after_cost = max(0.0, rem_after_shortfall - cost_adj_b)
+        threshold_net_b = min(rem_after_cost, threshold_omitted_b)
+        if threshold_net_b <= 1e-10:
+            threshold_net_b = 0.0
+
+        lot_resid_b = max(0.0, rem_after_cost - threshold_net_b)
+        if lot_resid_b <= 1e-10:
+            lot_resid_b = 0.0
+
+        shortfall_by_broker[bid] = shortfall_b
+        cost_adjusted_buy_reduction_by_broker[bid] = cost_adj_b
+        threshold_omitted_buy_by_broker[bid] = threshold_net_b
+        lot_rounding_residual_by_broker[bid] = lot_resid_b
 
     if used_same_broker_sell_proceeds:
         warnings.append(
@@ -1045,6 +1118,8 @@ def compute_rebalancing_plan(
 
     negative_cash_brokers = [bid for bid, cval in ending_cash_by_broker.items() if cval < -1e-6]
     total_shortfall = sum(shortfall_by_broker.values())
+    if abs(total_shortfall) < 1e-10:
+        total_shortfall = 0.0
 
     if negative_cash_brokers:
         status = "insufficient_cash"
@@ -1056,7 +1131,7 @@ def compute_rebalancing_plan(
         status = "infeasible_hard_limits"
         feasible = False
         warnings.extend(hard_conflicts)
-    elif total_shortfall > 1e-4:
+    elif total_shortfall > 1e-6:
         status = "partially_funded"
         feasible = False
     else:
@@ -1086,6 +1161,10 @@ def compute_rebalancing_plan(
         buy_spread_by_broker,
         ending_cash_by_broker,
         shortfall_by_broker,
+        desired_buy_gross_by_broker=desired_buy_gross_by_broker,
+        cost_adjusted_buy_reduction_by_broker=cost_adjusted_buy_reduction_by_broker,
+        threshold_omitted_buy_by_broker=threshold_omitted_buy_by_broker,
+        lot_rounding_residual_by_broker=lot_rounding_residual_by_broker,
     )
 
     return RebalancingResult(
