@@ -14,9 +14,10 @@ Key invariants:
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -229,13 +230,88 @@ def _normalize_datetime_index(
     return dt_idx.as_unit("ns")
 
 
+_ISO_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _resolve_cutoff_timestamp(
+    cutoff: Union[pd.Timestamp, datetime, date, str],
+    target_tz: Optional[str] = None,
+) -> Tuple[pd.Timestamp, bool]:
+    """Resolve an ``as_of_cutoff`` into ``(local_naive_ts_ns, is_date_only)``.
+
+    Temporal contract (AUD-04):
+    - Pure ``datetime.date`` (not ``datetime.datetime``) and pure ``YYYY-MM-DD``
+      ISO date strings are ``date-only`` (``is_date_only=True``, end-of-day
+      ``23:59:59.999999999`` in ``target_tz``).
+    - Naive ``pd.Timestamp`` / ``datetime.datetime`` at exact midnight
+      (``ts == ts.normalize()``) retain legacy ``date-only`` end-of-day
+      semantics for backwards compatibility. Because naive midnight is
+      inherently ambiguous between a calendar date and a ``00:00:00`` instant,
+      callers needing an explicit midnight instant MUST pass a tz-aware
+      timestamp (e.g. ``pd.Timestamp("2025-07-04 00:00:00", tz="America/New_York")``
+      or ``"2025-07-04T04:00:00Z"``) or an explicit time string
+      (e.g. ``"2025-07-04 00:00:00"``).
+    - ANY tz-aware timestamp/datetime/ISO string is ALWAYS treated as an exact
+      instant (``is_date_only=False``), even when its wall-clock time in
+      ``target_tz`` is ``00:00:00``.
+    - Any timestamp with non-zero hour/minute/second/microsecond/nanosecond
+      (``ts != ts.normalize()``) or explicit time string is ALWAYS
+      ``is_date_only=False``.
+    - Never uses process local timezone; tz-aware inputs convert via
+      ``ZoneInfo(target_tz)`` (respecting DST) or ``UTC`` when ``target_tz`` is ``None``.
+    """
+    if isinstance(cutoff, date) and not isinstance(cutoff, datetime):
+        ts = pd.Timestamp(cutoff).as_unit("ns")
+        return ts, True
+
+    is_explicit_time_str = False
+    is_iso_date_str = False
+    if isinstance(cutoff, str):
+        raw = cutoff.strip()
+        if not raw:
+            raise DataQualityError("Invalid empty string for as_of_cutoff.")
+        if _ISO_DATE_ONLY_RE.fullmatch(raw):
+            is_iso_date_str = True
+        else:
+            is_explicit_time_str = True
+        try:
+            ts = pd.Timestamp(raw)
+        except Exception as exc:
+            raise DataQualityError(f"Invalid as_of_cutoff string '{cutoff}': {exc}") from exc
+    else:
+        try:
+            ts = pd.Timestamp(cutoff)
+        except Exception as exc:
+            raise DataQualityError(f"Invalid as_of_cutoff value {cutoff!r}: {exc}") from exc
+
+    if pd.isna(ts):
+        raise DataQualityError(f"Invalid NaT value for as_of_cutoff: {cutoff!r}.")
+
+    orig_has_tz = ts.tz is not None
+    if orig_has_tz:
+        ts_local = (
+            ts.tz_convert(ZoneInfo(target_tz)).tz_localize(None)
+            if target_tz
+            else ts.tz_convert("UTC").tz_localize(None)
+        )
+        return ts_local.as_unit("ns"), False
+
+    ts_naive = ts.as_unit("ns")
+    if is_iso_date_str:
+        return ts_naive, True
+    if is_explicit_time_str:
+        return ts_naive, False
+    is_date_only = bool(ts_naive == ts_naive.normalize())
+    return ts_naive, is_date_only
+
+
 def sanitize_price_series(
     series: pd.Series,
     *,
     asset_id: str = "",
     duplicate_date_policy: str = "last",
     target_tz: Optional[str] = None,
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
     require_positive: bool = True,
 ) -> SanitizedSeriesResult:
     """Sort series chronologically ascending, handle duplicate dates, and filter invalid values."""
@@ -250,10 +326,9 @@ def sanitize_price_series(
         s = s.sort_index(ascending=True, kind="mergesort")
 
     if as_of_cutoff is not None:
-        cutoff_ts = pd.Timestamp(as_of_cutoff)
-        if cutoff_ts.tz is not None:
-            cutoff_ts = cutoff_ts.tz_convert(ZoneInfo(target_tz)).tz_localize(None) if target_tz else cutoff_ts.tz_convert("UTC").tz_localize(None)
-        cutoff_ts = cutoff_ts.as_unit("ns")
+        cutoff_ts, cutoff_is_date_only = _resolve_cutoff_timestamp(as_of_cutoff, target_tz=target_tz)
+        if cutoff_is_date_only and cutoff_ts == cutoff_ts.normalize():
+            cutoff_ts = (cutoff_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
         s = s[s.index <= cutoff_ts]
 
     if require_positive:
@@ -444,6 +519,21 @@ def _extract_close_series(df: pd.DataFrame) -> pd.Series:
     return df[col]
 
 
+def _extract_unadjusted_close_series(df: pd.DataFrame) -> pd.Series:
+    """Extract strictly unadjusted ``Close`` Series (never ``Adj Close``) from yfinance DataFrame."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = df.columns.get_level_values(0)
+        if "Close" not in lvl0:
+            return pd.Series(dtype=float)
+        sub = df["Close"]
+        return sub.iloc[:, 0] if isinstance(sub, pd.DataFrame) else sub
+    if "Close" not in df.columns:
+        return pd.Series(dtype=float)
+    return df["Close"]
+
+
 def _download_fx_series(fx_symbol: str, period: str = "10y") -> pd.Series:
     fx_data = yf.download(fx_symbol, period=period, auto_adjust=True, progress=False)
     return _extract_close_series(fx_data)
@@ -550,10 +640,8 @@ def _download_prices(
             if unadjusted_close_out is not None:
                 try:
                     hist_unadj = ticker_obj.history(period=period, auto_adjust=False)
-                    if hist_unadj is not None and not hist_unadj.empty and "Close" in hist_unadj.columns:
-                        raw_unadj = hist_unadj["Close"]
-                        if isinstance(raw_unadj, pd.DataFrame):
-                            raw_unadj = raw_unadj.iloc[:, 0]
+                    raw_unadj = _extract_unadjusted_close_series(hist_unadj)
+                    if not raw_unadj.empty:
                         unadj_usd, _ = convert_price_series_to_usd(
                             asset_id=ticker_upper,
                             prices=raw_unadj,
@@ -591,13 +679,12 @@ def _assign_weekly_friday_bin(
     cutoff_hour: int = 17,
 ) -> pd.DatetimeIndex:
     """Assign each timestamp to its Friday-ending (W-FRI) bin without post-cutoff leakage."""
-    has_intraday_time = bool(((index.hour != 0) | (index.minute != 0) | (index.second != 0)).any())
+    norm_idx = index.normalize()
+    has_intraday_time = bool((index != norm_idx).any())
     adjusted = index
     if has_intraday_time:
-        friday_after_cutoff = (adjusted.day_of_week == 4) & (
-            (adjusted.hour > cutoff_hour)
-            | ((adjusted.hour == cutoff_hour) & ((adjusted.minute > 0) | (adjusted.second > 0)))
-        )
+        cutoff_td = pd.Timedelta(hours=int(cutoff_hour))
+        friday_after_cutoff = (adjusted.day_of_week == 4) & ((adjusted - norm_idx) > cutoff_td)
         if friday_after_cutoff.any():
             adjusted = pd.DatetimeIndex(
                 np.where(friday_after_cutoff, adjusted + pd.Timedelta(days=1), adjusted)
@@ -608,14 +695,12 @@ def _assign_weekly_friday_bin(
 
 
 def _normalize_cutoff_to_local_naive(
-    cutoff: pd.Timestamp,
+    cutoff: Union[pd.Timestamp, datetime, date, str],
     target_tz: str,
 ) -> pd.Timestamp:
     """Convert a cutoff timestamp into naive wall-clock time in ``target_tz`` (respecting DST)."""
-    ts = pd.Timestamp(cutoff)
-    if ts.tz is not None:
-        ts = ts.tz_convert(ZoneInfo(target_tz)).tz_localize(None)
-    return ts.as_unit("ns")
+    ts_local, _ = _resolve_cutoff_timestamp(cutoff, target_tz=target_tz)
+    return ts_local
 
 
 def _compute_last_closed_friday(
@@ -627,23 +712,28 @@ def _compute_last_closed_friday(
     """Compute the latest W-FRI bin whose Friday ``cutoff_hour:00`` close has occurred by ``ref_ts_local``.
 
     Semantics (AUD-04):
-    - A W-FRI week ending on Friday ``F`` closes at ``F 17:00:00`` (or configured ``cutoff_hour``)
-      in ``weekly_cutoff_tz`` (default ``America/New_York``, DST-aware when input timestamps are tz-aware).
-    - If ``ref_ts_local`` is date-only (midnight ``00:00:00`` with no intraday timestamps),
-      it represents end-of-day on that calendar date (``23:59:59``):
+    - A W-FRI week ending on Friday ``F`` closes at ``F <cutoff_hour>:00:00`` in
+      ``weekly_cutoff_tz`` (default ``America/New_York``, DST-aware via ``ZoneInfo``).
+    - If ``is_date_only_ref=True`` and ``ref_ts_local`` is at exact midnight
+      (``ref_ts_local == ref_ts_local.normalize()``), it represents end-of-day on
+      that calendar date (``23:59:59.999999999``):
         * Wednesday ``2025-07-02`` -> Friday ``2025-07-04 17:00`` has NOT occurred -> ``2025-06-27``.
         * Friday ``2025-07-04`` or Saturday ``2025-07-05`` -> Friday ``2025-07-04 17:00`` HAS occurred -> ``2025-07-04``.
-    - If ``ref_ts_local`` has an explicit intraday time (e.g., Friday ``16:00`` vs ``17:00`` vs ``18:30``),
-      it is compared directly against ``cand_fri + Timedelta(hours=cutoff_hour)``:
-        * Friday ``2025-07-04 16:00`` -> ``2025-06-27`` (week still open).
-        * Friday ``2025-07-04 17:00`` or ``18:30`` -> ``2025-07-04`` (week closed; post-17:00 crypto prints
-          belong to ``2025-07-11`` and are excluded as incomplete).
+    - If ``is_date_only_ref=False`` (including ANY tz-aware instant such as
+      ``2025-07-04 00:00:00 America/New_York`` / ``2025-07-04 04:00:00Z`` EDT /
+      ``2025-01-10 05:00:00Z`` EST, or any intraday timestamp with sub-day/sub-second
+      components), ``ref_ts_local`` is compared strictly against
+      ``cand_fri + Timedelta(hours=cutoff_hour)``:
+        * Friday ``2025-07-04 00:00:00-04:00`` (``04:00:00Z`` EDT) -> ``2025-06-27`` (17h before close).
+        * Friday ``2025-07-04 16:59:59.999999`` -> ``2025-06-27`` (week still open).
+        * Friday ``2025-07-04 17:00:00`` or ``18:30:00`` -> ``2025-07-04`` (week closed; post-17:00
+          prints belong to ``2025-07-11`` and are excluded as incomplete).
     - A Friday market holiday (e.g. Good Friday ``2025-04-18`` where last equity trade is Thursday ``2025-04-17``)
       is validly INCLUDED once ``ref_ts_local >= 2025-04-18 17:00`` (e.g., Saturday ``2025-04-19`` or any later date).
     """
-    eff_ref = ref_ts_local
-    if is_date_only_ref and eff_ref.hour == 0 and eff_ref.minute == 0 and eff_ref.second == 0 and eff_ref.nanosecond == 0:
-        eff_ref = eff_ref.normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    eff_ref = ref_ts_local.as_unit("ns")
+    if is_date_only_ref and eff_ref == eff_ref.normalize():
+        eff_ref = (eff_ref.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
 
     days_since_fri = (eff_ref.day_of_week - 4) % 7
     cand_fri = eff_ref.normalize() - pd.Timedelta(days=days_since_fri)
@@ -657,7 +747,7 @@ def compute_weekly_returns_w_fri(
     prices_usd: pd.DataFrame,
     *,
     risk_config: Optional[RiskModelConfig] = None,
-    as_of_cutoff: Optional[pd.Timestamp] = None,
+    as_of_cutoff: Optional[Union[pd.Timestamp, datetime, date, str]] = None,
 ) -> WeeklyReturnsBundle:
     """Build Friday-to-Friday (W-FRI) USD weekly returns excluding incomplete current weeks."""
     cfg = risk_config or RiskModelConfig()
@@ -694,15 +784,12 @@ def compute_weekly_returns_w_fri(
                 asset_id=str(col),
             )
         idx = san.series.index
-        if bool(((idx.hour != 0) | (idx.minute != 0) | (idx.second != 0)).any()):
+        if bool((idx != idx.normalize()).any()):
             any_intraday_obs = True
         sanitized_series_map[str(col)] = san.series
 
     if as_of_cutoff is not None:
-        ref_local = _normalize_cutoff_to_local_naive(as_of_cutoff, cfg.weekly_cutoff_tz)
-        cutoff_is_date_only = (
-            ref_local.hour == 0 and ref_local.minute == 0 and ref_local.second == 0 and ref_local.nanosecond == 0
-        )
+        ref_local, cutoff_is_date_only = _resolve_cutoff_timestamp(as_of_cutoff, target_tz=cfg.weekly_cutoff_tz)
         last_closed_friday = _compute_last_closed_friday(
             ref_local,
             cutoff_hour=cfg.weekly_cutoff_hour,
@@ -859,7 +946,7 @@ def get_current_vix_observation(
     max_staleness_days: int = 7,
 ) -> Tuple[Optional[float], Optional[pd.Timestamp], bool]:
     """Return ``(vix_value, observation_timestamp, is_stale)`` using strictly causal data."""
-    cutoff = pd.Timestamp(as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1) if as_of_date else None
+    cutoff = pd.Timestamp(as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1) if as_of_date else None
     series = vix_history
     if series is None:
         try:
