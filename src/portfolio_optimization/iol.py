@@ -19,12 +19,15 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
 from .errors import IOLQuoteError
 from .schemas import InstrumentConfig, IOLConfig, IOLQuoteResult
+
+_AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 IOL_DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
@@ -37,22 +40,40 @@ IOL_DEFAULT_HEADERS: Dict[str, str] = {
 
 _MISSING_TOKENS = frozenset({"", "-", "--", "—", "–", "n/a", "na", "s/d", "null", "none"})
 
-# Canonical fixed-income panel column keys mapped from normalized Spanish headers
-_HEADER_MATCHERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("symbol", ("simbolo",)),
-    ("last_price", ("ultimo operado", "ultimo")),
-    ("daily_change_pct", ("variacion diaria", "variacion")),
+# Exact normalized header names (Pass 1) and unambiguous substring aliases (Pass 2)
+_HEADER_EXACT_MATCHERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("symbol", ("simbolo", "especie", "ticker")),
+    ("last_price", ("ultimo operado", "ultimo", "ultimo precio")),
+    ("last_close", ("ultimo cierre", "cierre anterior", "cierre")),
+    ("market_time", ("ultimo horario", "ultima actualizacion", "fecha y hora", "hora", "fecha", "horario")),
+    ("daily_change_pct", ("variacion diaria", "variacion", "var. diaria", "var diaria")),
     ("bid_qty", ("cantidad compra", "cant. compra", "cant compra")),
     ("bid_price", ("precio compra", "compra")),
     ("ask_price", ("precio venta", "venta")),
     ("ask_qty", ("cantidad venta", "cant. venta", "cant venta")),
     ("high", ("maximo",)),
     ("low", ("minimo",)),
-    ("last_close", ("ultimo cierre", "cierre anterior")),
     ("volume_amount", ("monto operado", "monto")),
     ("tir", ("t. i. r.", "t.i.r.", "tir")),
-    ("duration_md", ("duracion", "duration")),
-    ("market_time", ("hora", "fecha", "actualizacion")),
+    ("duration_md", ("duracion (md)", "duracion", "duration")),
+)
+
+_HEADER_ALIAS_MATCHERS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
+    # (key, required_substrings, forbidden_substrings)
+    ("symbol", ("simbolo",), ()),
+    ("market_time", ("horario", "hora", "fecha", "actualizacion"), ()),
+    ("last_close", ("ultimo cierre", "cierre anterior"), ()),
+    ("last_price", ("ultimo operado", "ultimo precio", "ultimo"), ("cierre", "hora", "horario", "fecha", "actualizacion", "var", "monto", "cant")),
+    ("daily_change_pct", ("variacion diaria", "variacion"), ()),
+    ("bid_qty", ("cantidad compra", "cant. compra", "cant compra"), ()),
+    ("bid_price", ("precio compra", "compra"), ("cant",)),
+    ("ask_qty", ("cantidad venta", "cant. venta", "cant venta"), ()),
+    ("ask_price", ("precio venta", "venta"), ("cant",)),
+    ("high", ("maximo",), ()),
+    ("low", ("minimo",), ()),
+    ("volume_amount", ("monto operado", "monto"), ()),
+    ("tir", ("t. i. r.", "t.i.r.", "tir"), ()),
+    ("duration_md", ("duracion", "duration"), ()),
 )
 
 
@@ -75,6 +96,7 @@ class IOLPanelRow:
     tir: Optional[float] = None
     duration_md: Optional[float] = None
     market_timestamp: Optional[str] = None
+    quote_unit: Optional[str] = None
     raw_symbol_cell: str = ""
 
 
@@ -236,26 +258,56 @@ def extract_ticker_and_name(raw_symbol_text: str) -> Tuple[str, str]:
 
 
 def _map_header_columns(header_cells: List[str]) -> Dict[str, int]:
-    """Map semantic column keys by normalized header text (not blind position)."""
+    """Map semantic column keys by exact normalized header text first, then unambiguous aliases.
+
+    Raises ``IOLQuoteError`` on ambiguous required-column collisions so non-price columns
+    (e.g. ``"Último Horario"``) can never hijack ``last_price``.
+    """
     norm_headers = [normalize_text(h) for h in header_cells]
     mapping: Dict[str, int] = {}
+    used_cols: set[int] = set()
 
-    for col_idx, htext in enumerate(norm_headers):
-        if not htext:
+    # Pass 1: exact normalized header matches (strictest priority)
+    for key, exact_names in _HEADER_EXACT_MATCHERS:
+        exact_matches = [idx for idx, htext in enumerate(norm_headers) if htext in exact_names and idx not in used_cols]
+        if len(exact_matches) == 1:
+            mapping[key] = exact_matches[0]
+            used_cols.add(exact_matches[0])
+        elif len(exact_matches) > 1:
+            if key in ("symbol", "last_price"):
+                raise IOLQuoteError(
+                    f"Ambiguous IOL table header collision for required column '{key}': "
+                    f"{[header_cells[i] for i in exact_matches]}.",
+                    details={"ambiguous_key": key, "matching_headers": [header_cells[i] for i in exact_matches]},
+                )
+            mapping[key] = exact_matches[0]
+            used_cols.add(exact_matches[0])
+
+    # Pass 2: unambiguous substring aliases on remaining unmapped keys & columns
+    for key, aliases, forbidden in _HEADER_ALIAS_MATCHERS:
+        if key in mapping:
             continue
-        for key, aliases in _HEADER_MATCHERS:
-            if key in mapping:
-                continue
-            if any(alias in htext for alias in aliases):
-                # Avoid confusing 'ultimo cierre' with 'ultimo operado'
-                if key == "last_price" and "cierre" in htext:
-                    continue
-                if key == "bid_price" and "cant" in htext:
-                    continue
-                if key == "ask_price" and "cant" in htext:
-                    continue
-                mapping[key] = col_idx
-                break
+        alias_matches = [
+            idx
+            for idx, htext in enumerate(norm_headers)
+            if idx not in used_cols
+            and htext
+            and any(alias in htext for alias in aliases)
+            and not any(bad in htext for bad in forbidden)
+        ]
+        if len(alias_matches) == 1:
+            mapping[key] = alias_matches[0]
+            used_cols.add(alias_matches[0])
+        elif len(alias_matches) > 1:
+            if key in ("symbol", "last_price"):
+                raise IOLQuoteError(
+                    f"Ambiguous IOL table header collision for required column '{key}': "
+                    f"{[header_cells[i] for i in alias_matches]}.",
+                    details={"ambiguous_key": key, "matching_headers": [header_cells[i] for i in alias_matches]},
+                )
+            mapping[key] = alias_matches[0]
+            used_cols.add(alias_matches[0])
+
     return mapping
 
 
@@ -426,30 +478,36 @@ def fetch_iol_panel(
     else:
         raise IOLQuoteError(f"Unsupported IOL panel_source '{panel_source}'. Expected 'iol_bonos' or 'iol_ons'.")
 
-    http = session or requests.Session()
+    owns_session = session is None
+    http = requests.Session() if owns_session else session
     try:
-        response = http.get(
-            url,
-            headers=IOL_DEFAULT_HEADERS,
-            timeout=cfg.timeout_seconds,
-            allow_redirects=True,
-            verify=True,
-        )
-    except requests.RequestException as exc:
-        raise IOLQuoteError(
-            f"Network/HTTP error querying IOL panel '{panel_source}': {type(exc).__name__}",
-            details={"panel_source": panel_source, "url": url, "error_type": type(exc).__name__},
-        ) from exc
+        try:
+            response = http.get(
+                url,
+                headers=IOL_DEFAULT_HEADERS,
+                timeout=cfg.timeout_seconds,
+                allow_redirects=True,
+                verify=True,
+            )
+        except requests.RequestException as exc:
+            raise IOLQuoteError(
+                f"Network/HTTP error querying IOL panel '{panel_source}': {type(exc).__name__}",
+                details={"panel_source": panel_source, "url": url, "error_type": type(exc).__name__},
+            ) from exc
 
-    if response.status_code < 200 or response.status_code >= 300:
-        raise IOLQuoteError(
-            f"IOL panel '{panel_source}' returned HTTP {response.status_code}.",
-            details={"panel_source": panel_source, "url": url, "status_code": response.status_code},
-        )
+        if response.status_code < 200 or response.status_code >= 300:
+            raise IOLQuoteError(
+                f"IOL panel '{panel_source}' returned HTTP {response.status_code}.",
+                details={"panel_source": panel_source, "url": url, "status_code": response.status_code},
+            )
 
-    observed_at = datetime.now(timezone.utc).isoformat()
-    # Respect UTF-8 decoding as in Actualizar Datos.gs
-    html_text = response.content.decode("utf-8", errors="replace") if isinstance(response.content, (bytes, bytearray)) else str(response.text)
+        observed_at = datetime.now(timezone.utc).isoformat()
+        # Respect UTF-8 decoding as in Actualizar Datos.gs
+        html_text = response.content.decode("utf-8", errors="replace") if isinstance(response.content, (bytes, bytearray)) else str(response.text)
+    finally:
+        if owns_session:
+            http.close()
+
     return parse_iol_fixed_income_table(
         html_text,
         panel_source=panel_source,
@@ -463,17 +521,107 @@ def _valid_positive(val: Optional[float]) -> bool:
     return val is not None and isinstance(val, (int, float)) and math.isfinite(val) and float(val) > 0.0
 
 
+def _parse_iol_market_timestamp(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse an IOL market timestamp into a UTC timezone-aware ``datetime`` (or ``None`` if absent).
+
+    Supports ISO-8601 (with or without tz) and Argentine formats (``dd/mm/yyyy HH:MM[:SS]``,
+    ``dd-mm-yyyy HH:MM[:SS]``, ``dd/mm/yyyy``). Naive timestamps are interpreted in
+    ``America/Argentina/Buenos_Aires``. Raises ``IOLQuoteError`` on malformed strings.
+    """
+    if raw_ts is None:
+        return None
+    text = clean_cell_text(str(raw_ts))
+    if not text or text.lower() in _MISSING_TOKENS:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_AR_TZ)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=_AR_TZ)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+    raise IOLQuoteError(
+        f"Unparseable IOL market_timestamp '{text}'; cannot verify quote contemporaneity.",
+        details={"raw_market_timestamp": text},
+    )
+
+
+def _normalize_mep_leg_to_per_100_vn(
+    ticker: str,
+    price: float,
+    quote_unit: Optional[str],
+) -> Tuple[float, str]:
+    """Normalize a verified AL30/AL30D leg price to per-100-original-nominal when unit metadata is explicit."""
+    if quote_unit is None:
+        return price, "panel_default_per_100_original_nominal"
+    qu = str(quote_unit).strip().lower()
+    if qu == "unknown":
+        raise IOLQuoteError(
+            f"Quote unit for '{ticker}' is 'unknown'; refusing implicit MEP without verified nominal base.",
+            asset_id=ticker,
+            details={"ticker": ticker, "quote_unit": quote_unit},
+        )
+    if qu == "per_100_original_nominal":
+        return price, "per_100_original_nominal"
+    if qu in ("per_1_original_nominal", "per_unit_1_vn"):
+        return price * 100.0, "normalized_from_per_1_original_nominal"
+    raise IOLQuoteError(
+        f"Unsupported or incompatible quote_unit '{quote_unit}' on '{ticker}' for implicit MEP.",
+        asset_id=ticker,
+        details={"ticker": ticker, "quote_unit": quote_unit},
+    )
+
+
 def compute_implicit_mep_al30(
     bonos_snapshot: IOLPanelSnapshot,
     *,
     reference_observed_at: Optional[str] = None,
-    max_time_skew_seconds: float = 300.0,
+    max_time_skew_seconds: Optional[float] = None,
+    max_market_time_diff_seconds: Optional[float] = None,
+    max_quote_age_seconds: Optional[float] = None,
+    allow_missing_market_timestamp: Optional[bool] = None,
+    mep_plausible_min: Optional[float] = None,
+    mep_plausible_max: Optional[float] = None,
+    iol_config: Optional[IOLConfig] = None,
 ) -> Dict[str, Any]:
     """Compute implicit ARS/USD MEP rate strictly from AL30 / AL30D in the Bonos panel.
 
-    Validates exact symbol match, positive finite prices, contemporaneous
-    observations, and comparable nominal base. Never falls back to any other FX.
+    Validates exact symbol match, issuer identity compatibility, positive finite prices,
+    HTTP snapshot contemporaneity, real ``market_timestamp`` contemporaneity/age when
+    exposed (with explicit conservative policy when absent), verified nominal units,
+    and configurable plausibility bounds. Never invents timestamps or falls back to
+    non-AL30 FX sources.
     """
+    cfg = iol_config or IOLConfig()
+    eff_http_skew = cfg.max_mep_time_skew_seconds if max_time_skew_seconds is None else float(max_time_skew_seconds)
+    eff_mkt_diff = cfg.max_mep_market_time_diff_seconds if max_market_time_diff_seconds is None else float(max_market_time_diff_seconds)
+    eff_max_age = cfg.max_mep_quote_age_seconds if max_quote_age_seconds is None else float(max_quote_age_seconds)
+    eff_allow_missing_ts = (
+        cfg.allow_mep_without_market_timestamp
+        if allow_missing_market_timestamp is None
+        else bool(allow_missing_market_timestamp)
+    )
+    eff_min_mep = cfg.mep_plausible_min if mep_plausible_min is None else float(mep_plausible_min)
+    eff_max_mep = cfg.mep_plausible_max if mep_plausible_max is None else float(mep_plausible_max)
+
     al30 = bonos_snapshot.rows_by_ticker.get("AL30")
     al30d = bonos_snapshot.rows_by_ticker.get("AL30D")
 
@@ -490,21 +638,106 @@ def compute_implicit_mep_al30(
             details={"al30d_present": al30d is not None, "al30d_last": None if al30d is None else al30d.last_price},
         )
 
+    if not _names_look_compatible(al30.name, al30d.name):
+        raise IOLQuoteError(
+            f"AL30 ('{al30.name}') and AL30D ('{al30d.name}') appear to belong to different instruments; refusing implicit MEP.",
+            details={"al30_name": al30.name, "al30d_name": al30d.name},
+        )
+
+    t_bonos_obs: Optional[datetime] = None
+    try:
+        t_bonos_obs = datetime.fromisoformat(bonos_snapshot.observed_at.replace("Z", "+00:00"))
+        if t_bonos_obs.tzinfo is None:
+            t_bonos_obs = t_bonos_obs.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise IOLQuoteError("Invalid snapshot observed_at timestamp format while validating MEP.") from exc
+
     if reference_observed_at:
         try:
-            t_bonos = datetime.fromisoformat(bonos_snapshot.observed_at.replace("Z", "+00:00"))
             t_ref = datetime.fromisoformat(reference_observed_at.replace("Z", "+00:00"))
-            skew = abs((t_bonos - t_ref).total_seconds())
-            if skew > max_time_skew_seconds:
+            if t_ref.tzinfo is None:
+                t_ref = t_ref.replace(tzinfo=timezone.utc)
+            skew = abs((t_bonos_obs - t_ref).total_seconds())
+            if skew > eff_http_skew:
                 raise IOLQuoteError(
-                    f"AL30/AL30D MEP snapshot is not contemporaneous with target quote (time skew {skew:.1f}s > {max_time_skew_seconds:.1f}s).",
-                    details={"skew_seconds": skew, "max_skew_seconds": max_time_skew_seconds},
+                    f"AL30/AL30D MEP snapshot is not contemporaneous with target quote (fetch skew {skew:.1f}s > {eff_http_skew:.1f}s).",
+                    details={"skew_seconds": skew, "max_skew_seconds": eff_http_skew},
                 )
         except ValueError as exc:
             raise IOLQuoteError("Invalid observation timestamp format while validating MEP contemporaneity.") from exc
 
-    al30_px = float(al30.last_price)
-    al30d_px = float(al30d.last_price)
+    # Market timestamp validation (real trade/update timestamps distinct from HTTP observed_at)
+    ts_al30 = _parse_iol_market_timestamp(al30.market_timestamp)
+    ts_al30d = _parse_iol_market_timestamp(al30d.market_timestamp)
+    unit_warnings: List[str] = []
+    simultaneity_verified = False
+    market_time_diff_seconds: Optional[float] = None
+
+    if ts_al30 is not None and ts_al30d is not None:
+        market_time_diff_seconds = abs((ts_al30 - ts_al30d).total_seconds())
+        if market_time_diff_seconds > eff_mkt_diff:
+            raise IOLQuoteError(
+                f"AL30 ({al30.market_timestamp}) and AL30D ({al30d.market_timestamp}) market timestamps diverge by "
+                f"{market_time_diff_seconds:.1f}s (> allowed {eff_mkt_diff:.1f}s); refusing non-contemporaneous implicit MEP.",
+                details={
+                    "al30_market_timestamp": al30.market_timestamp,
+                    "al30d_market_timestamp": al30d.market_timestamp,
+                    "market_time_diff_seconds": market_time_diff_seconds,
+                    "max_market_time_diff_seconds": eff_mkt_diff,
+                },
+            )
+        if eff_max_age is not None:
+            for leg_name, leg_ts in (("AL30", ts_al30), ("AL30D", ts_al30d)):
+                age = (t_bonos_obs - leg_ts).total_seconds()
+                if age > eff_max_age:
+                    raise IOLQuoteError(
+                        f"IOL quote '{leg_name}' market timestamp ({leg_ts.isoformat()}) is stale by {age:.1f}s (> allowed {eff_max_age:.1f}s).",
+                        asset_id=leg_name,
+                        details={"age_seconds": age, "max_quote_age_seconds": eff_max_age},
+                    )
+        simultaneity_verified = True
+    elif (ts_al30 is None) != (ts_al30d is None):
+        raise IOLQuoteError(
+            f"Asymmetric market timestamps for AL30 ({al30.market_timestamp}) and AL30D ({al30d.market_timestamp}); "
+            "cannot verify contemporaneity of implicit MEP.",
+            details={
+                "al30_market_timestamp": al30.market_timestamp,
+                "al30d_market_timestamp": al30d.market_timestamp,
+            },
+        )
+    else:
+        if not eff_allow_missing_ts:
+            raise IOLQuoteError(
+                "AL30 and AL30D lack market trade timestamps in the IOL panel; simultaneity cannot be verified. "
+                "Set IOLConfig(allow_mep_without_market_timestamp=True) to explicitly accept unverified simultaneity risk.",
+                details={
+                    "simultaneity_verified": False,
+                    "al30_market_timestamp": None,
+                    "al30d_market_timestamp": None,
+                },
+            )
+        unit_warnings.append(
+            "AL30 and AL30D market timestamps are absent in the IOL panel; MEP simultaneity is NOT verified "
+            "(explicitly accepted via allow_mep_without_market_timestamp=True; observed_at reflects fetch time only)."
+        )
+
+    # Nominal base / unit verification and normalization (only when explicitly verified)
+    raw_al30_px = float(al30.last_price)
+    raw_al30d_px = float(al30d.last_price)
+    if (al30.quote_unit is None) != (al30d.quote_unit is None):
+        raise IOLQuoteError(
+            f"Only one leg declares quote_unit (AL30={al30.quote_unit}, AL30D={al30d.quote_unit}); "
+            "refusing implicit MEP without comparable verified nominal bases.",
+            details={"al30_quote_unit": al30.quote_unit, "al30d_quote_unit": al30d.quote_unit},
+        )
+
+    al30_px, al30_unit_note = _normalize_mep_leg_to_per_100_vn("AL30", raw_al30_px, al30.quote_unit)
+    al30d_px, al30d_unit_note = _normalize_mep_leg_to_per_100_vn("AL30D", raw_al30d_px, al30d.quote_unit)
+    if al30_unit_note != al30d_unit_note and al30.quote_unit is not None and al30d.quote_unit is not None:
+        unit_warnings.append(
+            f"Normalized AL30 ({al30.quote_unit}) and AL30D ({al30d.quote_unit}) to common per-100-original-nominal basis using verified metadata."
+        )
+
     mep_rate = al30_px / al30d_px
     if not math.isfinite(mep_rate) or mep_rate <= 0.0:
         raise IOLQuoteError(
@@ -512,11 +745,32 @@ def compute_implicit_mep_al30(
             details={"al30": al30_px, "al30d": al30d_px},
         )
 
-    unit_warnings: List[str] = []
     if al30_px < al30d_px:
         raise IOLQuoteError(
             f"AL30 ({al30_px}) < AL30D ({al30d_px}) suggests non-comparable quote units or corrupted feed; refusing implicit MEP.",
             details={"al30": al30_px, "al30d": al30d_px, "mep_rate": mep_rate},
+        )
+
+    # Guard against unverified 100x nominal base mismatch (e.g., per-100 VN vs per-1 VN) and implausible ratios
+    if al30.quote_unit is None and al30d.quote_unit is None:
+        if (al30d_px < 5.0 and al30_px > 5000.0) or (al30_px < 5000.0 and al30d_px >= 20.0 and mep_rate < eff_min_mep):
+            raise IOLQuoteError(
+                f"AL30 ({al30_px}) vs AL30D ({al30d_px}) produces MEP={mep_rate:.4f}, indicating non-comparable nominal units "
+                "(e.g. per-100 VN vs per-1 VN) without verified unit metadata; refusing implicit MEP.",
+                details={"al30": al30_px, "al30d": al30d_px, "mep_rate": mep_rate},
+            )
+
+    if mep_rate < eff_min_mep or mep_rate > eff_max_mep:
+        raise IOLQuoteError(
+            f"Computed implicit MEP ({mep_rate:.4f} ARS/USD from AL30={al30_px} / AL30D={al30d_px}) falls outside "
+            f"configured plausible bounds [{eff_min_mep:g}, {eff_max_mep:g}], suggesting nominal-unit mismatch or feed corruption.",
+            details={
+                "al30": al30_px,
+                "al30d": al30d_px,
+                "mep_rate": mep_rate,
+                "mep_plausible_min": eff_min_mep,
+                "mep_plausible_max": eff_max_mep,
+            },
         )
 
     return {
@@ -526,6 +780,10 @@ def compute_implicit_mep_al30(
         "observed_at": bonos_snapshot.observed_at,
         "al30_market_timestamp": al30.market_timestamp,
         "al30d_market_timestamp": al30d.market_timestamp,
+        "simultaneity_verified": simultaneity_verified,
+        "market_time_diff_seconds": market_time_diff_seconds,
+        "al30_unit_basis": al30_unit_note,
+        "al30d_unit_basis": al30d_unit_note,
         "warnings": unit_warnings,
     }
 
@@ -536,7 +794,7 @@ def _names_look_compatible(name_a: str, name_b: str) -> bool:
         return True
     na = normalize_text(name_a)
     nb = normalize_text(name_b)
-    stop = {"d", "c", "usd", "ars", "u$s", "us$", "bono", "on", "clase", "ley", "arg", "ny"}
+    stop = {"d", "c", "usd", "ars", "u$s", "us$", "bono", "on", "clase", "ley", "arg", "ny", "sa", "corp", "emisor"}
     toks_a = {t for t in re.findall(r"[a-z0-9]+", na) if len(t) >= 2 and t not in stop}
     toks_b = {t for t in re.findall(r"[a-z0-9]+", nb) if len(t) >= 2 and t not in stop}
     if not toks_a or not toks_b:
@@ -549,7 +807,7 @@ def _resolve_species_candidates(
     panel_snapshot: IOLPanelSnapshot,
     explicit_species_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Optional[str]]:
-    """Determine exact candidate symbols for D, C, and ARS without blind concatenation."""
+    """Determine exact candidate symbols for D, C, and ARS with issuer compatibility across all branches."""
     tkr = requested_ticker.strip().upper()
     rows = panel_snapshot.rows_by_ticker
 
@@ -560,30 +818,49 @@ def _resolve_species_candidates(
             "ARS": explicit_species_map.get("ARS"),
         }
 
+    def _compat(ref_row: Optional[IOLPanelRow], cand_sym: Optional[str]) -> Optional[str]:
+        if cand_sym is None or cand_sym not in rows:
+            return None
+        if ref_row is not None and not _names_look_compatible(ref_row.name, rows[cand_sym].name):
+            return None
+        return cand_sym
+
     if len(tkr) >= 4 and tkr[-1] in ("D", "C"):
         stem = tkr[:-1]
+        req_row = rows.get(tkr)
         ars_candidate: Optional[str] = None
         d_candidate: Optional[str] = None
         c_candidate: Optional[str] = None
 
         if stem in rows:
-            ars_candidate = stem
-            d_candidate = f"{stem}D" if f"{stem}D" in rows else None
-            c_candidate = f"{stem}C" if f"{stem}C" in rows else None
+            ref = req_row or rows[stem]
+            ars_candidate = _compat(ref, stem)
+            d_candidate = _compat(ref, f"{stem}D")
+            c_candidate = _compat(ref, f"{stem}C")
+            # Preserve the explicitly requested symbol itself as its declared species if present
+            if req_row is not None:
+                if tkr.endswith("D"):
+                    d_candidate = tkr
+                else:
+                    c_candidate = tkr
         elif panel_snapshot.panel_source == "iol_ons" and len(tkr) == 5 and f"{stem}O" in rows:
-            ars_candidate = f"{stem}O"
-            d_candidate = f"{stem}D" if f"{stem}D" in rows else None
-            c_candidate = f"{stem}C" if f"{stem}C" in rows else None
+            ref = req_row or rows[f"{stem}O"]
+            ars_candidate = _compat(ref, f"{stem}O")
+            d_candidate = _compat(ref, f"{stem}D")
+            c_candidate = _compat(ref, f"{stem}C")
+            if req_row is not None:
+                if tkr.endswith("D"):
+                    d_candidate = tkr
+                else:
+                    c_candidate = tkr
         elif tkr in rows:
             if re.fullmatch(r"[A-Z]{2,4}\d{1,2}[DC]", tkr) or (panel_snapshot.panel_source == "iol_ons" and len(tkr) == 5):
                 if tkr.endswith("D"):
                     d_candidate = tkr
-                    if f"{stem}C" in rows:
-                        c_candidate = f"{stem}C"
+                    c_candidate = _compat(req_row, f"{stem}C")
                 else:
                     c_candidate = tkr
-                    if f"{stem}D" in rows:
-                        d_candidate = f"{stem}D"
+                    d_candidate = _compat(req_row, f"{stem}D")
             else:
                 raise IOLQuoteError(
                     f"Ambiguous ticker '{tkr}' ending in '{tkr[-1]}': cannot confirm whether it is a USD species or an ARS root symbol. Provide explicit 'iol_species_map'.",
@@ -600,21 +877,13 @@ def _resolve_species_candidates(
     if panel_snapshot.panel_source == "iol_ons" and len(tkr) == 5 and tkr.endswith("O"):
         stem = tkr[:-1]
         base_row = rows.get(tkr)
-        d_sym = f"{stem}D" if f"{stem}D" in rows else None
-        c_sym = f"{stem}C" if f"{stem}C" in rows else None
-        if d_sym and base_row and not _names_look_compatible(base_row.name, rows[d_sym].name):
-            d_sym = None
-        if c_sym and base_row and not _names_look_compatible(base_row.name, rows[c_sym].name):
-            c_sym = None
+        d_sym = _compat(base_row, f"{stem}D")
+        c_sym = _compat(base_row, f"{stem}C")
         return {"D": d_sym, "C": c_sym, "ARS": tkr if tkr in rows else None}
 
     base_row = rows.get(tkr)
-    d_sym = f"{tkr}D" if f"{tkr}D" in rows else None
-    c_sym = f"{tkr}C" if f"{tkr}C" in rows else None
-    if d_sym and base_row and not _names_look_compatible(base_row.name, rows[d_sym].name):
-        d_sym = None
-    if c_sym and base_row and not _names_look_compatible(base_row.name, rows[c_sym].name):
-        c_sym = None
+    d_sym = _compat(base_row, f"{tkr}D")
+    c_sym = _compat(base_row, f"{tkr}C")
     return {"D": d_sym, "C": c_sym, "ARS": tkr if tkr in rows else None}
 
 
@@ -747,7 +1016,7 @@ def resolve_iol_bond_quote_usd(
         mep = compute_implicit_mep_al30(
             ref_bonos,
             reference_observed_at=panel_snapshot.observed_at,
-            max_time_skew_seconds=cfg.max_mep_time_skew_seconds,
+            iol_config=cfg,
         )
         price_ars = float(row.last_price)
         mep_rate = float(mep["mep_rate_ars_per_usd"])
