@@ -66,6 +66,16 @@ CURRENCY_FX_SPECS: Dict[str, Tuple[str, str, float]] = {
 }
 
 
+_BASE_CURRENCY_OF_SUBUNIT: Dict[str, str] = {
+    "GBp": "GBP",
+    "GBX": "GBP",
+    "ZAc": "ZAR",
+    "ZAC": "ZAR",
+    "ILA": "ILS",
+    "ILX": "ILS",
+}
+
+
 @dataclass
 class SanitizedSeriesResult:
     series: pd.Series
@@ -86,6 +96,8 @@ class FXConversionDiagnostics:
     coverage_ratio: float
     dropped_stale_or_missing_fx: int
     max_staleness_days: int
+    economic_currency: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -97,10 +109,89 @@ class WeeklyReturnsBundle:
     total_grid_weeks: int
     aligned_weeks: int
     excluded_dates_count: int
+    last_closed_friday: Optional[pd.Timestamp] = None
+    excluded_incomplete_week_bins: List[str] = field(default_factory=list)
     missing_weeks_by_asset: Dict[str, int] = field(default_factory=dict)
     coverage_by_asset: Dict[str, float] = field(default_factory=dict)
     duplicate_dates_removed: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+
+
+def resolve_provider_currency(
+    asset_id: str,
+    provider_currency: Optional[str],
+    declared_currency: Optional[str] = None,
+) -> Tuple[str, str, List[str]]:
+    """Resolve effective quote currency and economic currency while validating conflicts.
+
+    Rules (AUD-01):
+    - Differentiates economic currency (e.g., ``GBP``) from subunit quote currency
+      (e.g., ``GBp`` / ``GBX`` requiring ``0.01`` scaling).
+    - Never assumes ``USD`` when both provider metadata and explicit override are absent.
+    - When user declares economic currency ``GBP`` and provider reports ``GBp``/``GBX``,
+      preserves the provider subunit quote currency so ``0.01`` scaling is applied.
+    - Rejects material currency conflicts (e.g., declared ``USD`` vs provider ``GBp``/``ARS``/``EUR``,
+      or declared subunit ``GBp`` vs provider major ``GBP``) with ``FXConversionError``.
+    """
+    prov = str(provider_currency).strip() if provider_currency is not None and str(provider_currency).strip() else None
+    decl = str(declared_currency).strip() if declared_currency is not None and str(declared_currency).strip() else None
+    warnings: List[str] = []
+
+    def _norm_code(code: str) -> str:
+        return code if code in _BASE_CURRENCY_OF_SUBUNIT else code.upper()
+
+    if decl is None:
+        if prov is None:
+            raise FXConversionError(
+                f"Missing currency metadata from market data provider for '{asset_id}'; cannot assume USD.",
+                asset_id=asset_id,
+                details={"provider_currency": None, "declared_currency": None},
+            )
+        eff_quote = _norm_code(prov)
+        econ = _BASE_CURRENCY_OF_SUBUNIT.get(eff_quote, eff_quote.upper())
+        return eff_quote, econ, warnings
+
+    decl_norm = _norm_code(decl)
+    decl_econ = _BASE_CURRENCY_OF_SUBUNIT.get(decl_norm, decl_norm.upper())
+
+    if prov is None:
+        warnings.append(
+            f"Provider omitted currency metadata for '{asset_id}'; using explicit declared currency '{decl_norm}'."
+        )
+        return decl_norm, decl_econ, warnings
+
+    prov_norm = _norm_code(prov)
+    prov_econ = _BASE_CURRENCY_OF_SUBUNIT.get(prov_norm, prov_norm.upper())
+
+    if prov_norm == decl_norm:
+        return prov_norm, prov_econ, warnings
+
+    if prov_econ == decl_econ:
+        if prov_norm in _BASE_CURRENCY_OF_SUBUNIT and decl_norm not in _BASE_CURRENCY_OF_SUBUNIT:
+            # Declared economic currency (e.g. GBP) matches provider subunit quote (e.g. GBp/GBX): apply 0.01!
+            warnings.append(
+                f"Asset '{asset_id}' declared economic currency '{decl_norm}' while provider quotes in subunit "
+                f"'{prov_norm}'; applying provider subunit scale (0.01) before FX conversion to USD."
+            )
+            return prov_norm, prov_econ, warnings
+        # Material 100x scale conflict (e.g. declared GBp vs provider GBP, or conflicting subunits)
+        raise FXConversionError(
+            f"Currency scale conflict for '{asset_id}': declared '{decl_norm}' conflicts with provider quote unit '{prov_norm}'.",
+            asset_id=asset_id,
+            details={"declared_currency": decl_norm, "provider_currency": prov_norm},
+        )
+
+    raise FXConversionError(
+        f"Material currency conflict for '{asset_id}': declared '{decl_norm}' (economic {decl_econ}) "
+        f"conflicts with provider currency '{prov_norm}' (economic {prov_econ}). Refusing to label mismatched prices as USD.",
+        asset_id=asset_id,
+        details={
+            "declared_currency": decl_norm,
+            "declared_economic_currency": decl_econ,
+            "provider_currency": prov_norm,
+            "provider_economic_currency": prov_econ,
+        },
+    )
 
 
 def get_currency_fx_spec(currency: str) -> Optional[Tuple[str, str, float]]:
@@ -365,58 +456,126 @@ def _download_prices(
     fx_max_staleness_days: int = 5,
     min_fx_coverage: float = 0.95,
     duplicate_date_policy: str = "last",
-    currency_overrides: Optional[Dict[str, str]] = None,
+    currency_overrides: Optional[Dict[str, Optional[str]]] = None,
     as_of_cutoff: Optional[pd.Timestamp] = None,
     fx_fetcher: Optional[Callable[[str, str], pd.Series]] = None,
+    allow_partial: bool = False,
+    errors_out: Optional[Dict[str, Dict[str, Any]]] = None,
+    fx_diagnostics_out: Optional[Dict[str, FXConversionDiagnostics]] = None,
+    unadjusted_close_out: Optional[Dict[str, pd.Series]] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """Download historical adjusted USD-normalized prices via yfinance."""
+    """Download historical adjusted USD-normalized prices via yfinance.
+
+    By default (``allow_partial=False``), FX/currency failures propagate immediately as
+    ``FXConversionError`` and history/provider failures propagate as ``InsufficientHistoryError``
+    (never silently dropping failed assets or masking FX root causes).
+    """
     fx_cache: Dict[str, pd.Series] = {}
     fetcher = fx_fetcher or _download_fx_series
-    overrides = {k.upper(): v for k, v in (currency_overrides or {}).items()}
+    overrides = {
+        k.upper(): v
+        for k, v in (currency_overrides or {}).items()
+        if v is not None and str(v).strip()
+    }
 
     dropped: List[str] = []
     series_map: Dict[str, pd.Series] = {}
+
+    def _handle_error(tkr_raw: str, tkr_up: str, exc: Exception) -> None:
+        if not allow_partial:
+            raise exc
+        dropped.append(tkr_raw)
+        if errors_out is not None:
+            if hasattr(exc, "to_dict"):
+                errors_out[tkr_up] = exc.to_dict()  # type: ignore[union-attr]
+            else:
+                errors_out[tkr_up] = {
+                    "code": type(exc).__name__,
+                    "asset_id": tkr_up,
+                    "message": str(exc),
+                }
 
     for ticker in tickers:
         ticker_upper = ticker.strip().upper()
         try:
             ticker_obj = yf.Ticker(ticker)
             info = ticker_obj.info or {}
-            currency = overrides.get(ticker_upper) or info.get("currency")
-            if not currency:
-                dropped.append(ticker)
-                continue
+            provider_currency = info.get("currency")
+            declared_currency = overrides.get(ticker_upper)
+            eff_currency, econ_currency, ccy_warnings = resolve_provider_currency(
+                asset_id=ticker_upper,
+                provider_currency=provider_currency,
+                declared_currency=declared_currency,
+            )
 
             hist = ticker_obj.history(period=period, auto_adjust=True)
             if hist is None or hist.empty:
-                dropped.append(ticker)
-                continue
+                raise InsufficientHistoryError(
+                    f"No historical price data returned by provider for '{ticker_upper}'.",
+                    asset_id=ticker_upper,
+                    details={"ticker": ticker, "period": period},
+                )
             raw_series = _extract_close_series(hist)
             if raw_series.empty:
-                dropped.append(ticker)
-                continue
+                raise InsufficientHistoryError(
+                    f"Provider returned historical table without usable Close/Adj Close column for '{ticker_upper}'.",
+                    asset_id=ticker_upper,
+                    details={"ticker": ticker},
+                )
 
             fx_series: Optional[pd.Series] = None
-            spec = get_currency_fx_spec(currency)
+            spec = get_currency_fx_spec(eff_currency)
             if spec is not None:
                 fx_sym = spec[0]
                 if fx_sym not in fx_cache:
                     fx_cache[fx_sym] = fetcher(fx_sym, period)
                 fx_series = fx_cache[fx_sym]
 
-            usd_series, _ = convert_price_series_to_usd(
+            usd_series, diag = convert_price_series_to_usd(
                 asset_id=ticker_upper,
                 prices=raw_series,
-                currency=currency,
+                currency=eff_currency,
                 fx_rates=fx_series,
                 fx_max_staleness_days=fx_max_staleness_days,
                 min_fx_coverage=min_fx_coverage,
                 duplicate_date_policy=duplicate_date_policy,
                 as_of_cutoff=as_of_cutoff,
             )
+            diag.economic_currency = econ_currency
+            diag.warnings.extend(ccy_warnings)
             series_map[ticker_upper] = usd_series
-        except Exception:
-            dropped.append(ticker)
+            if fx_diagnostics_out is not None:
+                fx_diagnostics_out[ticker_upper] = diag
+
+            if unadjusted_close_out is not None:
+                try:
+                    hist_unadj = ticker_obj.history(period=period, auto_adjust=False)
+                    if hist_unadj is not None and not hist_unadj.empty and "Close" in hist_unadj.columns:
+                        raw_unadj = hist_unadj["Close"]
+                        if isinstance(raw_unadj, pd.DataFrame):
+                            raw_unadj = raw_unadj.iloc[:, 0]
+                        unadj_usd, _ = convert_price_series_to_usd(
+                            asset_id=ticker_upper,
+                            prices=raw_unadj,
+                            currency=eff_currency,
+                            fx_rates=fx_series,
+                            fx_max_staleness_days=fx_max_staleness_days,
+                            min_fx_coverage=min_fx_coverage,
+                            duplicate_date_policy=duplicate_date_policy,
+                            as_of_cutoff=as_of_cutoff,
+                        )
+                        unadjusted_close_out[ticker_upper] = unadj_usd
+                except Exception:
+                    pass
+        except (FXConversionError, InsufficientHistoryError, DataQualityError) as exc:
+            _handle_error(ticker, ticker_upper, exc)
+        except Exception as exc:
+            wrapped = DataQualityError(
+                f"Provider error while downloading '{ticker_upper}': {type(exc).__name__}: {exc}",
+                asset_id=ticker_upper,
+                details={"ticker": ticker, "error_type": type(exc).__name__},
+            )
+            _handle_error(ticker, ticker_upper, wrapped)
 
     if not series_map:
         return pd.DataFrame(), dropped
@@ -448,13 +607,59 @@ def _assign_weekly_friday_bin(
     return pd.DatetimeIndex(bin_dates).as_unit("ns")
 
 
+def _normalize_cutoff_to_local_naive(
+    cutoff: pd.Timestamp,
+    target_tz: str,
+) -> pd.Timestamp:
+    """Convert a cutoff timestamp into naive wall-clock time in ``target_tz`` (respecting DST)."""
+    ts = pd.Timestamp(cutoff)
+    if ts.tz is not None:
+        ts = ts.tz_convert(ZoneInfo(target_tz)).tz_localize(None)
+    return ts.as_unit("ns")
+
+
+def _compute_last_closed_friday(
+    ref_ts_local: pd.Timestamp,
+    *,
+    cutoff_hour: int = 17,
+    is_date_only_ref: bool = False,
+) -> pd.Timestamp:
+    """Compute the latest W-FRI bin whose Friday ``cutoff_hour:00`` close has occurred by ``ref_ts_local``.
+
+    Semantics (AUD-04):
+    - A W-FRI week ending on Friday ``F`` closes at ``F 17:00:00`` (or configured ``cutoff_hour``)
+      in ``weekly_cutoff_tz`` (default ``America/New_York``, DST-aware when input timestamps are tz-aware).
+    - If ``ref_ts_local`` is date-only (midnight ``00:00:00`` with no intraday timestamps),
+      it represents end-of-day on that calendar date (``23:59:59``):
+        * Wednesday ``2025-07-02`` -> Friday ``2025-07-04 17:00`` has NOT occurred -> ``2025-06-27``.
+        * Friday ``2025-07-04`` or Saturday ``2025-07-05`` -> Friday ``2025-07-04 17:00`` HAS occurred -> ``2025-07-04``.
+    - If ``ref_ts_local`` has an explicit intraday time (e.g., Friday ``16:00`` vs ``17:00`` vs ``18:30``),
+      it is compared directly against ``cand_fri + Timedelta(hours=cutoff_hour)``:
+        * Friday ``2025-07-04 16:00`` -> ``2025-06-27`` (week still open).
+        * Friday ``2025-07-04 17:00`` or ``18:30`` -> ``2025-07-04`` (week closed; post-17:00 crypto prints
+          belong to ``2025-07-11`` and are excluded as incomplete).
+    - A Friday market holiday (e.g. Good Friday ``2025-04-18`` where last equity trade is Thursday ``2025-04-17``)
+      is validly INCLUDED once ``ref_ts_local >= 2025-04-18 17:00`` (e.g., Saturday ``2025-04-19`` or any later date).
+    """
+    eff_ref = ref_ts_local
+    if is_date_only_ref and eff_ref.hour == 0 and eff_ref.minute == 0 and eff_ref.second == 0 and eff_ref.nanosecond == 0:
+        eff_ref = eff_ref.normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+    days_since_fri = (eff_ref.day_of_week - 4) % 7
+    cand_fri = eff_ref.normalize() - pd.Timedelta(days=days_since_fri)
+    cand_close = cand_fri + pd.Timedelta(hours=int(cutoff_hour))
+    if eff_ref < cand_close:
+        return (cand_fri - pd.Timedelta(days=7)).as_unit("ns")
+    return cand_fri.as_unit("ns")
+
+
 def compute_weekly_returns_w_fri(
     prices_usd: pd.DataFrame,
     *,
     risk_config: Optional[RiskModelConfig] = None,
     as_of_cutoff: Optional[pd.Timestamp] = None,
 ) -> WeeklyReturnsBundle:
-    """Build Friday-to-Friday (W-FRI) USD weekly returns with strict data hygiene."""
+    """Build Friday-to-Friday (W-FRI) USD weekly returns excluding incomplete current weeks."""
     cfg = risk_config or RiskModelConfig()
     if prices_usd is None or prices_usd.empty:
         raise InsufficientHistoryError("Cannot compute weekly returns from empty price DataFrame.")
@@ -464,9 +669,10 @@ def compute_weekly_returns_w_fri(
             f"Duplicate asset columns found in price DataFrame: {list(prices_usd.columns[prices_usd.columns.duplicated()])}."
         )
 
-    weekly_price_cols: Dict[str, pd.Series] = {}
+    sanitized_series_map: Dict[str, pd.Series] = {}
     dup_removed: Dict[str, int] = {}
     warnings_list: List[str] = []
+    any_intraday_obs = False
 
     for col in prices_usd.columns:
         san = sanitize_price_series(
@@ -487,22 +693,67 @@ def compute_weekly_returns_w_fri(
                 f"Asset '{col}' has zero valid positive USD prices after sanitization.",
                 asset_id=str(col),
             )
+        idx = san.series.index
+        if bool(((idx.hour != 0) | (idx.minute != 0) | (idx.second != 0)).any()):
+            any_intraday_obs = True
+        sanitized_series_map[str(col)] = san.series
 
-        bins = _assign_weekly_friday_bin(san.series.index, cutoff_hour=cfg.weekly_cutoff_hour)
-        grouped = san.series.groupby(bins, sort=True).last()
-        weekly_price_cols[str(col)] = grouped
+    if as_of_cutoff is not None:
+        ref_local = _normalize_cutoff_to_local_naive(as_of_cutoff, cfg.weekly_cutoff_tz)
+        cutoff_is_date_only = (
+            ref_local.hour == 0 and ref_local.minute == 0 and ref_local.second == 0 and ref_local.nanosecond == 0
+        )
+        last_closed_friday = _compute_last_closed_friday(
+            ref_local,
+            cutoff_hour=cfg.weekly_cutoff_hour,
+            is_date_only_ref=cutoff_is_date_only,
+        )
+    else:
+        max_obs_ts = max(s.index.max() for s in sanitized_series_map.values())
+        last_closed_friday = _compute_last_closed_friday(
+            max_obs_ts,
+            cutoff_hour=cfg.weekly_cutoff_hour,
+            is_date_only_ref=not any_intraday_obs,
+        )
+
+    weekly_price_cols: Dict[str, pd.Series] = {}
+    incomplete_bins_found: set[pd.Timestamp] = set()
+
+    for col, san_s in sanitized_series_map.items():
+        bins = _assign_weekly_friday_bin(san_s.index, cutoff_hour=cfg.weekly_cutoff_hour)
+        grouped = san_s.groupby(bins, sort=True).last()
+        open_bins = grouped.index[grouped.index > last_closed_friday]
+        if len(open_bins) > 0:
+            for b in open_bins:
+                incomplete_bins_found.add(pd.Timestamp(b))
+            grouped = grouped.loc[grouped.index <= last_closed_friday]
+        if grouped.empty:
+            raise InsufficientHistoryError(
+                f"Asset '{col}' has zero observations in closed W-FRI weeks (last_closed_friday={last_closed_friday.date().isoformat()}).",
+                asset_id=col,
+            )
+        weekly_price_cols[col] = grouped
+
+    excluded_incomplete_bins = sorted(b.date().isoformat() for b in incomplete_bins_found)
+    if excluded_incomplete_bins:
+        warnings_list.append(
+            f"Excluded incomplete/unclosed W-FRI week bin(s) {excluded_incomplete_bins} after last closed Friday "
+            f"{last_closed_friday.date().isoformat()} ({cfg.weekly_cutoff_hour:02d}:00 {cfg.weekly_cutoff_tz})."
+        )
 
     first_common_week = max(s.index.min() for s in weekly_price_cols.values())
-    last_common_week = min(s.index.max() for s in weekly_price_cols.values())
+    last_common_week = min(min(s.index.max() for s in weekly_price_cols.values()), last_closed_friday)
 
     if first_common_week >= last_common_week:
         raise InsufficientHistoryError(
             "Assets have no overlapping historical date range for weekly return alignment.",
             details={
+                "last_closed_friday": last_closed_friday.date().isoformat(),
+                "excluded_incomplete_week_bins": excluded_incomplete_bins,
                 "asset_ranges": {
                     k: (str(v.index.min().date()), str(v.index.max().date()))
                     for k, v in weekly_price_cols.items()
-                }
+                },
             },
         )
 
@@ -552,6 +803,8 @@ def compute_weekly_returns_w_fri(
                 "min_weekly_observations": min_required,
                 "missing_weeks_by_asset": missing_weeks_by_asset,
                 "excluded_dates_count": excluded_dates,
+                "excluded_incomplete_week_bins": excluded_incomplete_bins,
+                "last_closed_friday": last_closed_friday.date().isoformat(),
             },
         )
 
@@ -569,6 +822,8 @@ def compute_weekly_returns_w_fri(
         total_grid_weeks=len(full_friday_grid),
         aligned_weeks=len(aligned_returns),
         excluded_dates_count=excluded_dates,
+        last_closed_friday=last_closed_friday,
+        excluded_incomplete_week_bins=excluded_incomplete_bins,
         missing_weeks_by_asset=missing_weeks_by_asset,
         coverage_by_asset=coverage_by_asset,
         duplicate_dates_removed=dup_removed,
@@ -689,13 +944,21 @@ def descargar_precios_historicos(
     *,
     fx_max_staleness_days: int = 5,
     min_fx_coverage: float = 0.95,
+    currency_overrides: Optional[Dict[str, Optional[str]]] = None,
+    as_of_cutoff: Optional[pd.Timestamp] = None,
+    fx_fetcher: Optional[Callable[[str, str], pd.Series]] = None,
+    allow_partial: bool = False,
 ) -> pd.DataFrame:
-    """Download historical USD-normalized adjusted prices (no silent raw-currency fallback)."""
+    """Download historical USD-normalized adjusted prices (blocks on FX/data errors by default)."""
     prices, _ = _download_prices(
         tickers,
         period=periodo,
         fx_max_staleness_days=fx_max_staleness_days,
         min_fx_coverage=min_fx_coverage,
+        currency_overrides=currency_overrides,
+        as_of_cutoff=as_of_cutoff,
+        fx_fetcher=fx_fetcher,
+        allow_partial=allow_partial,
     )
     return prices
 
