@@ -6,6 +6,7 @@ initialization, and no API key validation.
 
 from __future__ import annotations
 
+from ._display import is_display_enabled
 from .analytics import (
     analizar_contribucion_marginal_riesgo,
     analizar_rendimiento_historico,
@@ -16,7 +17,6 @@ from .analytics import (
     generar_underwater_plot,
 )
 from .config import (
-    FRED_API_KEY,
     FRED_BASE_URL,
     configure_runtime,
     get_fred_api_key,
@@ -48,6 +48,7 @@ from .fixed_income import (
     day_count_fraction,
     evaluate_fixed_income_instrument,
     expand_and_validate_cashflows,
+    normalize_execution_price_to_usd_per_unit,
     solve_xirr_with_root_check,
 )
 from .iol import (
@@ -79,6 +80,7 @@ from .market_data import (
     get_risk_free_rate,
     metricas_portfolio,
     obtener_tasa_libre_riesgo,
+    resolve_provider_currency,
     sanitize_price_series,
 )
 from .notebook_ui import (
@@ -151,7 +153,15 @@ from .schemas import (
     VixRegimeConfig,
 )
 
+def __getattr__(name: str) -> object:
+    """Dynamic attribute fallback for ``FRED_API_KEY`` without import-time caching."""
+    if name == "FRED_API_KEY":
+        return get_fred_api_key()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
+    "is_display_enabled",
     "FRED_API_KEY",
     "FRED_BASE_URL",
     "configure_runtime",
@@ -204,6 +214,7 @@ __all__ = [
     "fetch_iol_quotes_for_instruments",
     "day_count_fraction",
     "compute_dirty_price_per_reference",
+    "normalize_execution_price_to_usd_per_unit",
     "expand_and_validate_cashflows",
     "solve_xirr_with_root_check",
     "evaluate_fixed_income_instrument",
@@ -213,6 +224,7 @@ __all__ = [
     "SanitizedSeriesResult",
     "WeeklyReturnsBundle",
     "get_currency_fx_spec",
+    "resolve_provider_currency",
     "sanitize_price_series",
     "convert_price_series_to_usd",
     "compute_weekly_returns_w_fri",
