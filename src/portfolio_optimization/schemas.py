@@ -1826,7 +1826,7 @@ class RebalancingResult:
     """Indicative multi-broker rebalancing plan with full cash & cost reconciliation."""
 
     strategy_name: str
-    status: str  # "ok" | "skipped_no_positions" | "infeasible_hard_limits" | "insufficient_cash" | "broker_routing_required"
+    status: str  # "ok" | "partially_funded" | "skipped_no_positions" | "skipped_invalid_strategy_target" | "missing_tradable_market_price" | "infeasible_hard_limits" | "insufficient_cash" | "broker_routing_required"
     feasible: bool
     orders: List[ProposedOrder] = field(default_factory=list)
     omitted_operations: List[OmittedTrade] = field(default_factory=list)
@@ -1854,6 +1854,7 @@ class RebalancingResult:
     one_way_turnover: float = 0.0
     two_way_turnover: float = 0.0
     hard_limit_conflicts: List[str] = field(default_factory=list)
+    unpriced_instruments: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:

@@ -627,6 +627,9 @@ def _compute_max_feasible_excess_return(
     return float(resolved.feasible_starting_point @ excess_vec)
 
 
+_EXCESS_RETURN_ZERO_TOL = 1e-12
+
+
 def optimize_max_sharpe(
     mu: pd.Series,
     cov_matrix: pd.DataFrame,
@@ -656,9 +659,21 @@ def optimize_max_sharpe(
     vol_zero_tol = 1e-8
 
     if n == 1:
-        w1 = np.array([1.0], dtype=float)
-        vol1 = math.sqrt(max(float(sigma[0, 0]), 0.0))
-        excess1 = float(mu_arr[0]) - float(rf)
+        w1 = np.array([float(resolved.budget_sum)], dtype=float)
+        ok1, viol1 = verify_solution_feasibility(w1, resolved)
+        if not ok1:
+            raise OptimizationConvergenceError(
+                "Single-asset Max Sharpe allocation is infeasible under active constraints: " + "; ".join(viol1),
+                details={"strategy": "max_sharpe", "n_assets": 1, "violations": viol1},
+            )
+        var1 = float(sigma[0, 0])
+        if var1 < -1e-12:
+            raise OptimizationConvergenceError(
+                f"Single-asset covariance entry is negative ({var1:.3e}); invalid covariance matrix.",
+                details={"strategy": "max_sharpe", "n_assets": 1, "variance": var1},
+            )
+        vol1 = math.sqrt(max(var1, 0.0))
+        excess1 = float(w1[0] * mu_arr[0]) - float(rf)
         if vol1 <= vol_zero_tol:
             return _assemble_strategy_result(
                 strategy_name="max_sharpe",
@@ -671,10 +686,43 @@ def optimize_max_sharpe(
                 cvar_confidence=cvar_confidence,
                 converged=False,
                 status="singular_zero_variance",
-                diagnostics={"n_assets": 1, "zero_variance_detected": True, "is_valid_target": False},
+                diagnostics={
+                    "n_assets": 1,
+                    "solver": "single_asset_exact",
+                    "zero_variance_detected": True,
+                    "max_feasible_excess_return": excess1,
+                    "policy": non_positive_excess_return_policy,
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
                 warnings=["Single-asset variance is zero; Sharpe ratio denominator is undefined."],
             )
-        if excess1 <= 1e-12 and non_positive_excess_return_policy == "block":
+        if excess1 <= _EXCESS_RETURN_ZERO_TOL:
+            if non_positive_excess_return_policy == "block":
+                return _assemble_strategy_result(
+                    strategy_name="max_sharpe",
+                    weights=w1,
+                    resolved=resolved,
+                    cov_matrix=cov_matrix,
+                    mu=mu,
+                    rf=rf,
+                    weekly_returns=weekly_returns,
+                    cvar_confidence=cvar_confidence,
+                    converged=False,
+                    status="blocked_non_positive_excess",
+                    diagnostics={
+                        "n_assets": 1,
+                        "solver": "exact_excess_return_gate",
+                        "max_feasible_excess_return": excess1,
+                        "policy": "block",
+                        "is_valid_target": False,
+                        "solver_tolerance": resolved.solver_tolerance,
+                    },
+                    warnings=[
+                        f"Single-asset expected excess return is {excess1:.6%} (<= 0%); "
+                        "Max Sharpe is blocked under non_positive_excess_return_policy='block'."
+                    ],
+                )
             return _assemble_strategy_result(
                 strategy_name="max_sharpe",
                 weights=w1,
@@ -684,10 +732,21 @@ def optimize_max_sharpe(
                 rf=rf,
                 weekly_returns=weekly_returns,
                 cvar_confidence=cvar_confidence,
-                converged=False,
-                status="blocked_non_positive_excess",
-                diagnostics={"n_assets": 1, "max_feasible_excess_return": excess1, "is_valid_target": False},
-                warnings=["Single-asset expected excess return is <= 0; Max Sharpe blocked under policy='block'."],
+                converged=True,
+                status="suboptimal_non_positive_excess",
+                diagnostics={
+                    "n_assets": 1,
+                    "solver": "single_asset_exact",
+                    "max_feasible_excess_return": excess1,
+                    "policy": "allow_with_warning",
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
+                warnings=[
+                    f"Single-asset expected excess return is {excess1:.6%} (<= 0%); "
+                    "Sharpe ratio is non-positive and marked suboptimal_non_positive_excess "
+                    "(explicitly permitted for diagnostics via policy='allow_with_warning', not approved as a rebalancing target)."
+                ],
             )
         return _assemble_strategy_result(
             strategy_name="max_sharpe",
@@ -698,12 +757,20 @@ def optimize_max_sharpe(
             rf=rf,
             weekly_returns=weekly_returns,
             cvar_confidence=cvar_confidence,
-            diagnostics={"n_assets": 1, "note": "Single-asset unique feasible allocation.", "is_valid_target": True},
+            diagnostics={
+                "n_assets": 1,
+                "solver": "single_asset_exact",
+                "max_feasible_excess_return": excess1,
+                "policy": non_positive_excess_return_policy,
+                "note": "Single-asset unique feasible allocation.",
+                "is_valid_target": True,
+                "solver_tolerance": resolved.solver_tolerance,
+            },
         )
 
     # 1. Exact check of maximum feasible excess return under ALL active constraints (AUD-05)
     max_feasible_excess = _compute_max_feasible_excess_return(mu_arr, rf, resolved)
-    non_positive_excess = max_feasible_excess <= 1e-12
+    non_positive_excess = max_feasible_excess <= _EXCESS_RETURN_ZERO_TOL
     warnings_list: List[str] = []
 
     if non_positive_excess:
@@ -917,6 +984,7 @@ def optimize_max_sharpe(
             "solver": "SLSQP",
             "iterations": best_conv_nit,
             "max_feasible_excess_return": max_feasible_excess,
+            "policy": non_positive_excess_return_policy,
             "solver_tolerance": resolved.solver_tolerance,
             "is_valid_target": not non_positive_excess,
         },
@@ -1690,6 +1758,278 @@ def get_sector_map(tickers_list: Sequence[str]) -> Dict[str, str]:
     return sectors
 
 
+@dataclass(frozen=True)
+class _TradablePriceResolution:
+    """Single source of truth for an instrument's tradable market price resolution (NEW-01)."""
+
+    instrument_id: str
+    tradable: bool
+    quoted_price_usd: Optional[float]
+    quoted_price_for_terms: Optional[float]
+    quoted_currency_for_terms: Optional[str]
+    source: Optional[str]
+    series_type: str
+    quote_unit: Optional[str]
+    price_timestamp: Optional[str]
+    blocked_reason: Optional[str] = None
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+
+def _resolve_tradable_market_price(
+    inst: InstrumentConfig,
+    *,
+    iol_quotes: Dict[str, IOLQuoteResult],
+    prices_cols: Dict[str, pd.Series],
+    direct_price_sources: Dict[str, str],
+    unadjusted_closes: Dict[str, pd.Series],
+    proxies_used: Dict[str, str],
+    duplicate_date_policy: str,
+    weekly_cutoff_tz: str,
+    as_of_cutoff: Optional[pd.Timestamp],
+    as_of_date: Optional[Any] = None,
+) -> _TradablePriceResolution:
+    """Resolve a single authoritative tradable market price shared by YTM, valuation, and rebalancing.
+
+    Precedence (preserving AUD-02, AUD-06, AUD-09):
+    1. Valid IOL quote (``iol_quotes[iid]``)
+    2. Explicit ``inst.manual_price_usd``
+    3. Direct historical price series (``direct_price_sources[iid]``):
+       - For individual debt (``INDIVIDUAL_DEBT_SUBTYPES`` or instruments carrying
+         ``fixed_income_terms``):
+         * Series marked ``historical_price_series_type == "adjusted_total_return"`` is
+           NEVER treated as a tradable clean/dirty market price (blocked for both YTM and
+           rebalancing; risk model may still use it as a total-return risk series).
+         * When ``quote_source == "yfinance"`` and ``historical_price_series_type == "market_price"``,
+           strictly requires ``unadjusted_closes[ticker]`` (``auto_adjust=False``) and NEVER
+           falls back to ``auto_adjust=True``.
+         * Risk proxies (``proxies_used``) are NEVER treated as tradable bond market prices.
+       - For all other instruments (equities, ETFs, gold, crypto): uses sanitized historical
+         USD series up to ``as_of_cutoff``.
+    """
+    iid = inst.instrument_id
+    terms = inst.fixed_income_terms
+    is_individual_debt = (inst.asset_subtype in INDIVIDUAL_DEBT_SUBTYPES) or (terms is not None)
+
+    # 1. Valid IOL snapshot quote
+    if iid in iol_quotes:
+        iq = iol_quotes[iid]
+        q_usd = float(iq.price_usd)
+        if terms is not None and terms.cashflow_currency != "USD":
+            q_terms = iq.price_original
+            ccy_terms = iq.original_currency
+        else:
+            q_terms = q_usd
+            ccy_terms = "USD"
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=q_usd,
+            quoted_price_for_terms=q_terms,
+            quoted_currency_for_terms=ccy_terms,
+            source=iq.panel_source,
+            series_type="iol_snapshot",
+            quote_unit=iq.quote_unit,
+            price_timestamp=iq.market_timestamp or iq.observed_at,
+        )
+
+    # 2. Explicit manual_price_usd
+    if inst.manual_price_usd is not None:
+        m_usd = float(inst.manual_price_usd)
+        terms_is_usd = terms is None or terms.cashflow_currency == "USD"
+        ts_str = (
+            terms.settlement_date.isoformat()
+            if terms is not None
+            else (as_of_date.isoformat() if as_of_date is not None else None)
+        )
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=m_usd,
+            quoted_price_for_terms=m_usd if terms_is_usd else None,
+            quoted_currency_for_terms="USD" if terms_is_usd else None,
+            source="manual_price_usd",
+            series_type="manual_price_usd",
+            quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+            price_timestamp=ts_str,
+        )
+
+    # 3. Direct historical series for individual debt (strict tradable market-price guards)
+    if is_individual_debt:
+        if iid not in direct_price_sources:
+            if iid in proxies_used:
+                proxy_sym = proxies_used[iid]
+                return _TradablePriceResolution(
+                    instrument_id=iid,
+                    tradable=False,
+                    quoted_price_usd=None,
+                    quoted_price_for_terms=None,
+                    quoted_currency_for_terms=None,
+                    source=f"proxy:{proxy_sym}",
+                    series_type="proxy_only",
+                    quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                    price_timestamp=None,
+                    blocked_reason=(
+                        f"Individual debt instrument '{iid}' lacks a tradable market price "
+                        f"(no IOL quote, no manual_price_usd, and no direct market price series; "
+                        f"risk proxy '{proxy_sym}' is not a tradable bond price)."
+                    ),
+                )
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=None,
+                series_type="missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"Individual debt instrument '{iid}' lacks a tradable market price "
+                    "(no IOL quote, no manual_price_usd, and no direct historical market price)."
+                ),
+            )
+
+        hist_src = direct_price_sources[iid]
+        if inst.historical_price_series_type == "adjusted_total_return":
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="adjusted_total_return",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"Historical series from '{hist_src}' for '{iid}' is marked 'adjusted_total_return' "
+                    "and is not a tradable clean/dirty market price suitable for contractual YTM, valuation, or rebalancing. "
+                    "Supply an IOL quote or explicit manual_price_usd."
+                ),
+            )
+
+        dl_key = inst.ticker.upper()
+        if hist_src == "yfinance":
+            candidate_series = unadjusted_closes.get(dl_key)
+            if candidate_series is None or candidate_series.empty:
+                return _TradablePriceResolution(
+                    instrument_id=iid,
+                    tradable=False,
+                    quoted_price_usd=None,
+                    quoted_price_for_terms=None,
+                    quoted_currency_for_terms=None,
+                    source="yfinance",
+                    series_type="missing_unadjusted_close",
+                    quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                    price_timestamp=None,
+                    blocked_reason=(
+                        f"Unadjusted yfinance Close series (auto_adjust=False) is unavailable for individual debt '{iid}'; "
+                        "refusing to fall back to auto_adjust=True total-return series as a tradable market price."
+                    ),
+                )
+            series_type_lbl = "yfinance_unadjusted_close"
+        else:
+            candidate_series = prices_cols.get(iid)
+            series_type_lbl = "prices_usd_override_market_price"
+
+        if candidate_series is None or candidate_series.empty:
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=f"No valid positive historical market price series available for '{iid}' from '{hist_src}'.",
+            )
+
+        san_debt = sanitize_price_series(
+            candidate_series,
+            asset_id=iid,
+            duplicate_date_policy=duplicate_date_policy,
+            target_tz=weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            require_positive=True,
+        )
+        if san_debt.series.empty:
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="missing_unadjusted_close" if hist_src == "yfinance" else "missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"No valid positive tradable market price observation available for '{iid}' "
+                    f"from '{hist_src}' on or before cutoff."
+                ),
+            )
+
+        px_val = float(san_debt.series.iloc[-1])
+        px_ts = pd.Timestamp(san_debt.series.index[-1]).date().isoformat()
+        terms_is_usd = terms is None or terms.cashflow_currency == "USD"
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=px_val,
+            quoted_price_for_terms=px_val if terms_is_usd else None,
+            quoted_currency_for_terms="USD" if terms_is_usd else None,
+            source=hist_src,
+            series_type=series_type_lbl,
+            quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+            price_timestamp=px_ts,
+        )
+
+    # 4. Non-individual-debt instruments (equities, ETFs, gold, crypto, etc.)
+    raw_series = prices_cols.get(iid)
+    if raw_series is not None and not raw_series.empty:
+        san_latest = sanitize_price_series(
+            raw_series,
+            asset_id=iid,
+            duplicate_date_policy=duplicate_date_policy,
+            target_tz=weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            require_positive=True,
+        )
+        if not san_latest.series.empty:
+            px_val = float(san_latest.series.iloc[-1])
+            px_ts = pd.Timestamp(san_latest.series.index[-1]).date().isoformat()
+            src_lbl = direct_price_sources.get(iid) or (
+                f"proxy:{proxies_used[iid]}" if iid in proxies_used else inst.quote_source
+            )
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=True,
+                quoted_price_usd=px_val,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=src_lbl,
+                series_type=inst.historical_price_series_type,
+                quote_unit="per_unit",
+                price_timestamp=px_ts,
+            )
+
+    return _TradablePriceResolution(
+        instrument_id=iid,
+        tradable=False,
+        quoted_price_usd=None,
+        quoted_price_for_terms=None,
+        quoted_currency_for_terms=None,
+        source=direct_price_sources.get(iid),
+        series_type="missing",
+        quote_unit="per_unit",
+        price_timestamp=None,
+        blocked_reason=f"No valid positive USD price available for '{iid}' on or before cutoff.",
+    )
+
+
 def analyze_portfolio(
     config: Union[PortfolioAnalysisConfig, Dict[str, Any]],
     *,
@@ -1722,7 +2062,7 @@ def analyze_portfolio(
 
     as_of_cutoff: Optional[pd.Timestamp] = None
     if cfg.as_of_date is not None:
-        as_of_cutoff = pd.Timestamp(cfg.as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        as_of_cutoff = (pd.Timestamp(cfg.as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
 
     iol_quotes: Dict[str, IOLQuoteResult] = fetch_iol_quotes_for_instruments(
         instruments,
@@ -1805,75 +2145,46 @@ def analyze_portfolio(
                 if iid in yfinance_direct_ids:
                     direct_price_sources[iid] = "yfinance"
 
-    # AUD-09: Evaluate fixed-income contractual metrics AFTER resolving direct market prices (including
-    # prices_usd_override and yfinance) and BEFORE blocking on insufficient covariance history,
-    # so standalone YTM remains available and respects source precedence & non-adjusted price checks.
+    # NEW-01 & AUD-09: Resolve authoritative tradable market prices ONCE per instrument BEFORE
+    # fixed_income_metrics and BEFORE InsufficientHistoryError, and reuse the exact same resolution
+    # across fixed_income_metrics, latest_prices_usd, execution_prices_usd_per_unit, and rebalancing.
+    resolved_tradable_prices: Dict[str, _TradablePriceResolution] = {
+        inst.instrument_id: _resolve_tradable_market_price(
+            inst,
+            iol_quotes=iol_quotes,
+            prices_cols=prices_cols,
+            direct_price_sources=direct_price_sources,
+            unadjusted_closes=unadjusted_closes,
+            proxies_used=proxies_used,
+            duplicate_date_policy=cfg.risk.duplicate_date_policy,
+            weekly_cutoff_tz=cfg.risk.weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            as_of_date=cfg.as_of_date,
+        )
+        for inst in instruments
+    }
+
     fixed_income_metrics: Dict[str, FixedIncomeMetricsResult] = {}
     for inst in cfg.fixed_income:
         if inst.fixed_income_terms is None:
             continue
         iid = inst.instrument_id
         terms = inst.fixed_income_terms
-        quoted_px: Optional[float] = None
-        quoted_ccy: Optional[str] = None
-        src_used: Optional[str] = None
-        val_date_str: Optional[str] = None
-        fi_extra_warns: List[str] = []
-        not_eval_reason: Optional[str] = None
-
-        if iid in iol_quotes:
-            iq = iol_quotes[iid]
-            quoted_px = iq.price_usd if terms.cashflow_currency == "USD" else iq.price_original
-            quoted_ccy = "USD" if terms.cashflow_currency == "USD" else iq.original_currency
-            src_used = iq.panel_source
-            val_date_str = iq.market_timestamp or iq.observed_at
-        elif inst.manual_price_usd is not None and terms.cashflow_currency == "USD":
-            quoted_px = float(inst.manual_price_usd)
-            quoted_ccy = "USD"
-            src_used = "manual_price_usd"
-            val_date_str = terms.settlement_date.isoformat()
-        elif iid in direct_price_sources and terms.cashflow_currency == "USD":
-            hist_src = direct_price_sources[iid]
-            if inst.historical_price_series_type == "adjusted_total_return":
-                src_used = hist_src
-                not_eval_reason = (
-                    f"Historical series from '{hist_src}' for '{iid}' is marked 'adjusted_total_return' "
-                    "and is not a tradable clean/dirty market price suitable for contractual YTM."
-                )
-            else:
-                dl_key = inst.ticker.upper()
-                candidate_series = (
-                    unadjusted_closes[dl_key]
-                    if (hist_src == "yfinance" and dl_key in unadjusted_closes and not unadjusted_closes[dl_key].empty)
-                    else prices_cols[iid]
-                )
-                val_cutoff = as_of_cutoff
-                san_fi = sanitize_price_series(
-                    candidate_series,
-                    asset_id=iid,
-                    duplicate_date_policy=cfg.risk.duplicate_date_policy,
-                    target_tz=cfg.risk.weekly_cutoff_tz,
-                    as_of_cutoff=val_cutoff,
-                    require_positive=True,
-                )
-                if not san_fi.series.empty:
-                    quoted_px = float(san_fi.series.iloc[-1])
-                    quoted_ccy = "USD"
-                    src_used = hist_src
-                    val_date_str = pd.Timestamp(san_fi.series.index[-1]).date().isoformat()
-                    if hist_src == "yfinance" and dl_key not in unadjusted_closes:
-                        fi_extra_warns.append(
-                            f"Using yfinance Close series for '{iid}' YTM valuation (unadjusted Close unavailable); verify series represents tradable {terms.price_type} price."
-                        )
+        px_res = resolved_tradable_prices[iid]
+        not_eval_reason = (
+            px_res.blocked_reason
+            if (not px_res.tradable and px_res.series_type in ("adjusted_total_return", "missing_unadjusted_close", "proxy_only"))
+            else None
+        )
 
         fi_res = evaluate_fixed_income_instrument(
             iid,
             terms,
-            quoted_price=quoted_px,
-            quoted_price_currency=quoted_ccy,
-            quote_source_used=src_used,
-            valuation_price_date=val_date_str,
-            extra_warnings=fi_extra_warns,
+            quoted_price=px_res.quoted_price_for_terms,
+            quoted_price_currency=px_res.quoted_currency_for_terms,
+            quote_source_used=px_res.source,
+            valuation_price_date=px_res.price_timestamp,
+            extra_warnings=list(px_res.warnings),
             not_evaluable_reason=not_eval_reason,
         )
         fixed_income_metrics[iid] = fi_res
@@ -1931,33 +2242,22 @@ def analyze_portfolio(
     )
     warnings_list.extend(risk_result.warnings)
 
-    # Preserve published/latest market USD quote in latest_prices_usd AND compute canonical dirty
-    # execution USD price per 1 quantity unit (AUD-02) via shared helper.
+    # Preserve published/latest tradable market USD quote in latest_prices_usd AND compute canonical dirty
+    # execution USD price per 1 quantity unit (AUD-02 & NEW-01) from the exact same centralized resolution.
     latest_prices_usd: Dict[str, float] = {}
     quote_units_by_id: Dict[str, str] = {}
     execution_prices_usd_per_unit: Dict[str, float] = {}
     price_unit_metadata: Dict[str, Dict[str, Any]] = {}
+    unpriced_instruments: Dict[str, str] = {}
+    price_resolution_audit: Dict[str, Dict[str, Any]] = {}
 
     for iid in ordered_ids:
         inst = inst_map[iid]
-        if iid in iol_quotes:
-            latest_prices_usd[iid] = float(iol_quotes[iid].price_usd)
-            quote_units_by_id[iid] = iol_quotes[iid].quote_unit
-        elif inst.manual_price_usd is not None:
-            latest_prices_usd[iid] = float(inst.manual_price_usd)
-        else:
-            san_latest = sanitize_price_series(
-                prices_usd[iid],
-                asset_id=iid,
-                duplicate_date_policy=cfg.risk.duplicate_date_policy,
-                target_tz=cfg.risk.weekly_cutoff_tz,
-                as_of_cutoff=as_of_cutoff,
-                require_positive=True,
-            )
-            if not san_latest.series.empty:
-                latest_prices_usd[iid] = float(san_latest.series.iloc[-1])
-
-        if iid in latest_prices_usd:
+        px_res = resolved_tradable_prices[iid]
+        if px_res.tradable and px_res.quoted_price_usd is not None:
+            latest_prices_usd[iid] = float(px_res.quoted_price_usd)
+            if iid in iol_quotes:
+                quote_units_by_id[iid] = iol_quotes[iid].quote_unit
             unit_px, unit_meta = normalize_execution_price_to_usd_per_unit(
                 inst,
                 latest_prices_usd[iid],
@@ -1966,6 +2266,36 @@ def analyze_portfolio(
             execution_prices_usd_per_unit[iid] = float(unit_px)
             price_unit_metadata[iid] = unit_meta
             warnings_list.extend(unit_meta.get("warnings", []))
+            price_resolution_audit[iid] = {
+                "instrument_id": iid,
+                "tradable": True,
+                "source": px_res.source,
+                "series_type": px_res.series_type,
+                "currency": "USD",
+                "quoted_price_usd": latest_prices_usd[iid],
+                "execution_price_usd_per_unit": execution_prices_usd_per_unit[iid],
+                "quote_unit": unit_meta.get("quote_unit"),
+                "price_type": unit_meta.get("price_type"),
+                "price_timestamp": px_res.price_timestamp,
+                "blocked_reason": None,
+            }
+        else:
+            reason = px_res.blocked_reason or f"Instrument '{iid}' lacks a tradable USD market price."
+            unpriced_instruments[iid] = reason
+            warnings_list.append(reason)
+            price_resolution_audit[iid] = {
+                "instrument_id": iid,
+                "tradable": False,
+                "source": px_res.source,
+                "series_type": px_res.series_type,
+                "currency": None,
+                "quoted_price_usd": None,
+                "execution_price_usd_per_unit": None,
+                "quote_unit": px_res.quote_unit,
+                "price_type": inst.fixed_income_terms.price_type if inst.fixed_income_terms is not None else None,
+                "price_timestamp": px_res.price_timestamp,
+                "blocked_reason": reason,
+            }
 
     rf_rate = (
         float(cfg.black_litterman.rf_rate)
@@ -2071,17 +2401,39 @@ def analyze_portfolio(
             stress_results[strat_name] = entry
 
     rebalancing_results: Dict[str, Any] = {}
-    invalid_target_statuses = {"non_converged", "failed", "singular_zero_variance", "blocked_non_positive_excess"}
+    invalid_target_statuses = {
+        "non_converged",
+        "failed",
+        "singular_zero_variance",
+        "blocked_non_positive_excess",
+        "suboptimal_non_positive_excess",
+    }
     for strat_name, strat_res in strategies.items():
-        if not strat_res.converged or strat_res.status in invalid_target_statuses:
+        is_valid_target = bool(strat_res.diagnostics.get("is_valid_target", True))
+        if not strat_res.converged or strat_res.status in invalid_target_statuses or not is_valid_target:
             rebalancing_results[strat_name] = RebalancingResult(
                 strategy_name=strat_name,
                 status="skipped_invalid_strategy_target",
                 feasible=False,
                 theoretical_target_weights=dict(strat_res.weights_by_asset),
                 warnings=[
-                    f"Rebalancing skipped for strategy '{strat_name}' because optimizer did not produce a valid converged target "
-                    f"(status='{strat_res.status}', converged={strat_res.converged})."
+                    f"Rebalancing skipped for strategy '{strat_name}' because optimizer did not produce an approved valid target "
+                    f"(status='{strat_res.status}', converged={strat_res.converged}, is_valid_target={is_valid_target})."
+                ],
+            )
+            continue
+        if unpriced_instruments:
+            rebalancing_results[strat_name] = RebalancingResult(
+                strategy_name=strat_name,
+                status="missing_tradable_market_price",
+                feasible=False,
+                theoretical_target_weights=dict(strat_res.weights_by_asset),
+                unpriced_instruments=dict(unpriced_instruments),
+                warnings=[
+                    f"Rebalancing blocked for strategy '{strat_name}' because instrument(s) "
+                    f"{sorted(unpriced_instruments.keys())} lack a tradable USD market price "
+                    "(adjusted total-return series and risk proxies cannot value holdings or size orders): "
+                    + "; ".join(f"{k}: {v}" for k, v in sorted(unpriced_instruments.items()))
                 ],
             )
             continue
@@ -2108,6 +2460,8 @@ def analyze_portfolio(
         "latest_prices_usd": latest_prices_usd,
         "execution_prices_usd_per_unit": execution_prices_usd_per_unit,
         "price_unit_metadata": price_unit_metadata,
+        "price_resolution": price_resolution_audit,
+        "unpriced_instruments": unpriced_instruments,
         "fx_diagnostics": {
             k: {
                 "original_currency": d.original_currency,
