@@ -1,1085 +1,2538 @@
-"""Portfolio optimization, covariance estimation, Black-Litterman, and stress testing.
+"""Multi-asset portfolio constraints, optimizers (Sharpe, MinVar, CVaR, ERC, HRP),
+stress testing, and canonical stateless ``analyze_portfolio`` orchestration.
 
-Migrated faithfully from Cells 09, 10, 12, and 13 of the source notebook.
-Preserves exact execution order and effective redefinition of ``analyze_portfolio``
-(Cell 10 defined first as ``_analyze_portfolio_v1``, overridden by Cell 13's
-``analyze_portfolio``).
+Key invariants:
+- Zero hardcoded ``(0.05, 0.20)`` bounds and zero silent ``1/n`` fallbacks.
+- Joint LP feasibility validation runs BEFORE optimization and post-solution
+  feasibility verification runs AFTER every optimizer.
+- ERC and HRP operate purely on covariance/correlation without requiring ``mu``.
+- HRP never inverts Sigma and explicitly separates pure HRP from constraint-adjusted HRP.
+- Zero global mutable state, zero ML, zero country-risk spreads, zero dead chart stubs.
 """
 
 from __future__ import annotations
 
-import tempfile
+import math
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.optimize import minimize
-from sklearn.covariance import LedoitWolf, OAS as OAS_estimator
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.optimize import linprog, minimize
+from scipy.spatial.distance import squareform
 
-from . import state
-from .market_data import _download_prices, obtener_tasa_libre_riesgo
+from .errors import (
+    ConfigurationError,
+    DataQualityError,
+    FXConversionError,
+    InfeasibleConstraintsError,
+    InsufficientHistoryError,
+    OptimizationConvergenceError,
+)
+from .expected_returns import compute_expected_returns_pipeline
+from .fixed_income import (
+    evaluate_fixed_income_instrument,
+    normalize_execution_price_to_usd_per_unit,
+)
+from .iol import IOLPanelSnapshot, fetch_iol_quotes_for_instruments
+from .market_data import (
+    FXConversionDiagnostics,
+    _download_prices,
+    _normalize_datetime_index,
+    calcular_cvar_historico,
+    compute_weekly_returns_w_fri,
+    fetch_vix_history,
+    get_current_vix_observation,
+    get_risk_free_rate,
+    sanitize_price_series,
+)
+from .rebalancing import compute_rebalancing_plan
+from .risk_model import WEEKS_PER_YEAR, covariance_to_correlation, ensure_psd_covariance, estimate_risk_model
+from .schemas import (
+    INDIVIDUAL_DEBT_SUBTYPES,
+    REMOVED_LEGACY_KEYS,
+    AnalysisResult,
+    ConstraintsConfig,
+    FixedIncomeMetricsResult,
+    InstrumentConfig,
+    IOLQuoteResult,
+    PortfolioAnalysisConfig,
+    RebalancingResult,
+    RiskModelResult,
+    StrategyAllocationResult,
+)
 
 
-# =============================================================================
-# Cell 09: Sharpe optimization with HHI constraint
-# =============================================================================
+@dataclass(frozen=True)
+class ResolvedConstraints:
+    """Normalized numerical constraints bound to a specific ordered asset list."""
 
-def optimize_sharpe_hhi(mu: pd.Series, cov: pd.DataFrame, rf: float, hhi_limit: float = 0.15) -> np.ndarray:
-    """
-    Optimiza el portfolio para maximizar el Sharpe Ratio con restricción de diversificación HHI.
+    tickers: Tuple[str, ...]
+    bounds: Tuple[Tuple[float, float], ...]
+    class_indices: Dict[str, Tuple[int, ...]]
+    class_bounds: Dict[str, Tuple[float, float]]
+    sector_indices: Dict[str, Tuple[int, ...]]
+    max_sector_weight: Optional[float]
+    hhi_limit: Optional[float]
+    budget_sum: float
+    solver_tolerance: float
+    feasibility_tolerance: float
+    feasible_starting_point: np.ndarray
 
-    Parámetros:
-    -----------
-    mu : pd.Series
-        Vector de retornos esperados anualizados para cada activo.
-    cov : pd.DataFrame
-        Matriz de covarianza anualizada de los retornos.
-    rf : float
-        Tasa libre de riesgo anualizada.
-    hhi_limit : float, opcional (default=0.15)
-        Límite superior para el Índice Herfindahl-Hirschman (HHI).
-        HHI = Σ(wi²), donde wi es el peso del activo i.
-        Valores típicos: 0.15-0.20 para mayor diversificación.
 
-    Retorna:
-    --------
-    np.ndarray
-        Vector de pesos óptimos que maximiza el Sharpe Ratio sujeto a:
-        - Suma de pesos = 1
-        - Cada peso entre 0% y 50%
-        - HHI ≤ hhi_limit
+def _build_linear_ineq_matrices(
+    n: int,
+    class_indices: Dict[str, Tuple[int, ...]],
+    class_bounds: Dict[str, Tuple[float, float]],
+    sector_indices: Dict[str, Tuple[int, ...]],
+    max_sector_weight: Optional[float],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    rows: List[np.ndarray] = []
+    rhs: List[float] = []
 
-    Notas:
-    ------
-    La restricción HHI evita soluciones de esquina (concentración excesiva).
-    Un HHI más bajo implica mayor diversificación efectiva.
-    """
+    for rc, (lo, hi) in class_bounds.items():
+        idxs = class_indices.get(rc, ())
+        if lo > 0.0:
+            row = np.zeros(n, dtype=float)
+            for idx in idxs:
+                row[idx] = -1.0
+            rows.append(row)
+            rhs.append(-lo)
+        if hi < 1.0:
+            row = np.zeros(n, dtype=float)
+            for idx in idxs:
+                row[idx] = 1.0
+            rows.append(row)
+            rhs.append(hi)
 
-    n_assets = len(mu)
+    if max_sector_weight is not None and max_sector_weight < 1.0:
+        for sec, idxs in sector_indices.items():
+            if sec and sec != "Unknown" and len(idxs) >= 1:
+                row = np.zeros(n, dtype=float)
+                for idx in idxs:
+                    row[idx] = 1.0
+                rows.append(row)
+                rhs.append(max_sector_weight)
 
-    def neg_sharpe(weights):
-        ret = weights @ mu.values
-        vol = np.sqrt(weights @ cov.values @ weights)
-        return -(ret - rf) / vol if vol > 0 else 1e10
+    if not rows:
+        return None, None
+    return np.vstack(rows), np.asarray(rhs, dtype=float)
 
-    def hhi_constraint(weights):
-        """
-        Retorna un valor positivo si se cumple la restricción.
-        Para 'ineq': la función debe ser ≥ 0 para cumplir la restricción.
-        Queremos: hhi_limit - Σ(wi²) ≥ 0
-        """
-        hhi = np.sum(weights ** 2)
-        return hhi_limit - hhi
 
-    constraints = [
-        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},      # Suma de pesos = 1
-        {'type': 'ineq', 'fun': hhi_constraint}              # HHI ≤ hhi_limit
-    ]
+def validate_constraints_feasibility(
+    tickers: Sequence[str],
+    constraints: Optional[ConstraintsConfig] = None,
+    *,
+    risk_class_by_ticker: Optional[Dict[str, str]] = None,
+    sector_by_ticker: Optional[Dict[str, str]] = None,
+) -> ResolvedConstraints:
+    """Validate individual, class, sector, budget, and HHI constraints jointly via exact LP."""
+    cfg = constraints or ConstraintsConfig()
+    ordered = tuple(t.strip().upper() for t in tickers)
+    n = len(ordered)
+    if n == 0:
+        raise InfeasibleConstraintsError("Cannot optimize an empty asset universe.")
 
-    bounds = tuple((0.05, 0.20) for _ in range(n_assets))
+    rc_map = {k.strip().upper(): v.strip().lower() for k, v in (risk_class_by_ticker or {}).items()}
+    sec_map = {k.strip().upper(): v for k, v in (sector_by_ticker or {}).items()}
 
-    initial_guess = np.array([1/n_assets] * n_assets)
+    bounds: List[Tuple[float, float]] = []
+    for t in ordered:
+        lo, hi = cfg.asset_bounds.get(t, (0.0, 1.0))
+        if lo < 0.0 or hi > 1.0 or lo > hi:
+            raise InfeasibleConstraintsError(
+                f"Invalid bounds ({lo}, {hi}) for '{t}'.",
+                asset_id=t,
+            )
+        bounds.append((float(lo), float(hi)))
 
-    result = minimize(
-        neg_sharpe,
-        initial_guess,
-        method='SLSQP',
+    class_indices_mut: Dict[str, List[int]] = {}
+    for idx, t in enumerate(ordered):
+        rc = rc_map.get(t, "other")
+        class_indices_mut.setdefault(rc, []).append(idx)
+    class_indices = {rc: tuple(idxs) for rc, idxs in class_indices_mut.items()}
+
+    sector_indices_mut: Dict[str, List[int]] = {}
+    for idx, t in enumerate(ordered):
+        sec = sec_map.get(t, "Unknown")
+        sector_indices_mut.setdefault(sec, []).append(idx)
+    sector_indices = {s: tuple(idxs) for s, idxs in sector_indices_mut.items()}
+
+    conflicts: List[str] = []
+    suggestions: List[str] = []
+
+    sum_lo = sum(lo for lo, _ in bounds)
+    sum_hi = sum(hi for _, hi in bounds)
+    if sum_lo > cfg.budget_sum + cfg.feasibility_tolerance:
+        conflicts.append(
+            f"Sum of individual minimum weights ({sum_lo:.4%}) exceeds budget ({cfg.budget_sum:.4%})."
+        )
+        suggestions.append("Reduce individual minimum asset weights so their sum is <= 100%.")
+    if sum_hi < cfg.budget_sum - cfg.feasibility_tolerance:
+        conflicts.append(
+            f"Sum of individual maximum weights ({sum_hi:.4%}) is below budget ({cfg.budget_sum:.4%})."
+        )
+        suggestions.append("Increase individual maximum asset weights or add more assets so upper bounds sum to >= 100%.")
+
+    for rc, (clo, chi) in cfg.class_bounds.items():
+        idxs = class_indices.get(rc, ())
+        if len(idxs) == 0:
+            if clo > cfg.feasibility_tolerance:
+                conflicts.append(
+                    f"Risk class '{rc}' requires minimum exposure {clo:.2%}, but zero instruments belong to class '{rc}'."
+                )
+                suggestions.append(f"Add at least one '{rc}' instrument or set its class minimum to 0%.")
+            continue
+        cls_sum_lo = sum(bounds[i][0] for i in idxs)
+        cls_sum_hi = sum(bounds[i][1] for i in idxs)
+        if cls_sum_hi < clo - cfg.feasibility_tolerance:
+            conflicts.append(
+                f"Risk class '{rc}' minimum ({clo:.2%}) exceeds sum of its assets' upper bounds ({cls_sum_hi:.2%})."
+            )
+            suggestions.append(f"Lower '{rc}' class minimum or raise upper bounds of its member assets.")
+        if cls_sum_lo > chi + cfg.feasibility_tolerance:
+            conflicts.append(
+                f"Risk class '{rc}' maximum ({chi:.2%}) is below sum of its assets' lower bounds ({cls_sum_lo:.2%})."
+            )
+            suggestions.append(f"Raise '{rc}' class maximum or lower minimum bounds of its member assets.")
+
+    if conflicts:
+        raise InfeasibleConstraintsError(
+            "Portfolio constraints are jointly infeasible: " + " | ".join(conflicts),
+            details={"conflicts": conflicts, "suggestions": suggestions},
+        )
+
+    A_ub, b_ub = _build_linear_ineq_matrices(
+        n, class_indices, cfg.class_bounds, sector_indices, cfg.max_sector_weight
+    )
+    A_eq = np.ones((1, n), dtype=float)
+    b_eq = np.array([cfg.budget_sum], dtype=float)
+
+    lp_res = linprog(
+        c=np.zeros(n, dtype=float),
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
         bounds=bounds,
-        constraints=constraints,
-        options={'maxiter': 1000}
+        method="highs",
+        options={
+            "primal_feasibility_tolerance": min(float(cfg.feasibility_tolerance), 1e-7),
+            "dual_feasibility_tolerance": min(float(cfg.solver_tolerance), 1e-7),
+        },
+    )
+    if not lp_res.success or lp_res.x is None:
+        raise InfeasibleConstraintsError(
+            "Portfolio constraints are jointly infeasible (exact LP verification failed). "
+            "Individual bounds, class bounds, sector caps, and the 100% budget constraint have no common solution.",
+            details={
+                "lp_status": int(lp_res.status),
+                "lp_message": str(lp_res.message),
+                "asset_bounds": {t: b for t, b in zip(ordered, bounds)},
+                "class_bounds": dict(cfg.class_bounds),
+                "suggestions": [
+                    "Check that sum of class maximums across represented classes is >= 100% and sum of class minimums is <= 100%.",
+                    "Check overlaps between asset bounds, class bounds, and optional sector caps.",
+                ],
+            },
+        )
+
+    w_lp = np.asarray(lp_res.x, dtype=float)
+
+    lin_slsqp_cons = _build_slsqp_constraints(
+        n, class_indices, cfg.class_bounds, sector_indices, cfg.max_sector_weight, cfg.budget_sum, hhi_limit=None
+    )
+    min_hhi_res = minimize(
+        lambda w: float(np.sum(w * w)),
+        w_lp,
+        jac=lambda w: 2.0 * w,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=lin_slsqp_cons,
+        options={"maxiter": 1000, "ftol": cfg.solver_tolerance},
+    )
+    if min_hhi_res.success and _check_linear_feasibility(
+        min_hhi_res.x, bounds, class_indices, cfg.class_bounds, sector_indices, cfg.max_sector_weight, cfg.budget_sum, cfg.feasibility_tolerance
+    ):
+        w_center = np.asarray(min_hhi_res.x, dtype=float)
+    else:
+        w_center = w_lp
+
+    min_achievable_hhi = float(np.sum(w_center * w_center))
+    if cfg.hhi_limit is not None and min_achievable_hhi > cfg.hhi_limit + cfg.feasibility_tolerance:
+        raise InfeasibleConstraintsError(
+            f"Requested HHI limit ({cfg.hhi_limit:.4f}) is jointly infeasible with asset/class bounds "
+            f"(minimum achievable HHI is {min_achievable_hhi:.4f} for {n} asset(s)).",
+            details={
+                "requested_hhi_limit": cfg.hhi_limit,
+                "min_achievable_hhi": min_achievable_hhi,
+                "n_assets": n,
+                "suggestions": [
+                    f"Increase hhi_limit to at least {min_achievable_hhi:.4f} (or set hhi_limit=None), or add more diversified assets."
+                ],
+            },
+        )
+
+    return ResolvedConstraints(
+        tickers=ordered,
+        bounds=tuple(bounds),
+        class_indices=class_indices,
+        class_bounds=dict(cfg.class_bounds),
+        sector_indices=sector_indices,
+        max_sector_weight=cfg.max_sector_weight,
+        hhi_limit=cfg.hhi_limit,
+        budget_sum=cfg.budget_sum,
+        solver_tolerance=cfg.solver_tolerance,
+        feasibility_tolerance=cfg.feasibility_tolerance,
+        feasible_starting_point=w_center,
     )
 
-    if result.success:
-        final_hhi = np.sum(result.x ** 2)
-        print(f"✅ Optimización exitosa con HHI = {final_hhi:.4f} (límite: {hhi_limit:.4f})")
-        return result.x
-    else:
-        print(f"⚠️ La optimización no convergió. Usando pesos iguales.")
-        return initial_guess
+
+def _build_slsqp_constraints(
+    n: int,
+    class_indices: Dict[str, Tuple[int, ...]],
+    class_bounds: Dict[str, Tuple[float, float]],
+    sector_indices: Dict[str, Tuple[int, ...]],
+    max_sector_weight: Optional[float],
+    budget_sum: float,
+    hhi_limit: Optional[float],
+) -> List[Dict[str, Any]]:
+    cons: List[Dict[str, Any]] = [
+        {
+            "type": "eq",
+            "fun": lambda w, bs=budget_sum: float(np.sum(w) - bs),
+            "jac": lambda w: np.ones(n, dtype=float),
+        }
+    ]
+    for rc, (lo, hi) in class_bounds.items():
+        idxs = class_indices.get(rc, ())
+        if not idxs:
+            continue
+        vec = np.zeros(n, dtype=float)
+        vec[list(idxs)] = 1.0
+        if lo > 0.0:
+            cons.append({
+                "type": "ineq",
+                "fun": lambda w, v=vec, l=lo: float(v @ w - l),
+                "jac": lambda w, v=vec: v,
+            })
+        if hi < 1.0:
+            cons.append({
+                "type": "ineq",
+                "fun": lambda w, v=vec, u=hi: float(u - v @ w),
+                "jac": lambda w, v=vec: -v,
+            })
+
+    if max_sector_weight is not None and max_sector_weight < 1.0:
+        for sec, idxs in sector_indices.items():
+            if sec and sec != "Unknown" and len(idxs) >= 1:
+                vec = np.zeros(n, dtype=float)
+                vec[list(idxs)] = 1.0
+                cons.append({
+                    "type": "ineq",
+                    "fun": lambda w, v=vec, u=max_sector_weight: float(u - v @ w),
+                    "jac": lambda w, v=vec: -v,
+                })
+
+    if hhi_limit is not None:
+        cons.append({
+            "type": "ineq",
+            "fun": lambda w, hl=hhi_limit: float(hl - np.sum(w * w)),
+            "jac": lambda w: -2.0 * w,
+        })
+
+    return cons
 
 
-# =============================================================================
-# Cell 10: AnalysisResult, core optimizers, metrics, chart stubs, v1 pipeline
-# =============================================================================
-
-@dataclass
-class AnalysisResult:
-    """Resultado del análisis de portfolio"""
-    tickers: List[str]
-    expected_returns: pd.Series
-    cov_matrix: pd.DataFrame
-    weights_sharpe: np.ndarray
-    weights_minvar: np.ndarray
-    weights_cvar: np.ndarray
-    chart_path: Path
-    warnings: List[str]
-    stats_sharpe: dict
-    stats_minvar: dict
-    stats_cvar: dict
-    start_date: Optional[pd.Timestamp]
-    end_date: Optional[pd.Timestamp]
-    sample_days: int
-    used_expected: dict
-    hist_performance: dict
-    mcr_sharpe: pd.Series
-    mcr_minvar: pd.Series
-    mcr_cvar: pd.Series
-    prices_hist: pd.DataFrame
-    historical_perf_chart_path: Path
-    correlation_heatmap_path: Path
-    mcr_chart_path: Path
-    patrimonio_chart_path: Path
-    total_return_chart_path: Path
-    individual_returns_chart_path: Path
-    is_existing_portfolio: bool
-    stress_test_results: dict = field(default_factory=dict)
-    mu_sources: dict = field(default_factory=dict)
-    vix_level: Optional[float] = None
-    cov_inflation_factor: float = 1.0
+def _check_linear_feasibility(
+    w: np.ndarray,
+    bounds: Sequence[Tuple[float, float]],
+    class_indices: Dict[str, Tuple[int, ...]],
+    class_bounds: Dict[str, Tuple[float, float]],
+    sector_indices: Dict[str, Tuple[int, ...]],
+    max_sector_weight: Optional[float],
+    budget_sum: float,
+    tol: float,
+) -> bool:
+    if w is None or not np.all(np.isfinite(w)):
+        return False
+    if abs(float(np.sum(w)) - budget_sum) > tol:
+        return False
+    for i, (lo, hi) in enumerate(bounds):
+        if w[i] < lo - tol or w[i] > hi + tol:
+            return False
+    for rc, (lo, hi) in class_bounds.items():
+        idxs = class_indices.get(rc, ())
+        cw = float(sum(w[i] for i in idxs))
+        if cw < lo - tol or cw > hi + tol:
+            return False
+    if max_sector_weight is not None:
+        for sec, idxs in sector_indices.items():
+            if sec and sec != "Unknown" and len(idxs) >= 1:
+                if float(sum(w[i] for i in idxs)) > max_sector_weight + tol:
+                    return False
+    return True
 
 
-def _optimize_min_cvar(mu: pd.Series, cov: pd.DataFrame, daily_returns: pd.DataFrame, stress_bounds=None) -> np.ndarray:
-    n_assets = len(mu)
-    def portfolio_cvar(weights):
-        portfolio_returns = daily_returns.values @ weights
-        return abs(_calc_cvar(portfolio_returns, 0.95))
-    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
-    bounds = stress_bounds if stress_bounds else tuple((0.05, 0.20) for _ in range(n_assets))
-    initial_guess = np.array([1/n_assets] * n_assets)
-    result = minimize(portfolio_cvar, initial_guess, method='SLSQP',
-                     bounds=bounds, constraints=constraints, options={'maxiter': 1000})
-    return result.x if result.success else initial_guess
+def verify_solution_feasibility(
+    weights: np.ndarray,
+    resolved: ResolvedConstraints,
+) -> Tuple[bool, List[str]]:
+    """Verify a candidate weight vector satisfies EVERY constraint within tolerance."""
+    tol = resolved.feasibility_tolerance
+    violations: List[str] = []
+    w = np.asarray(weights, dtype=float)
+
+    if w.ndim != 1 or len(w) != len(resolved.tickers):
+        return False, ["Weight vector dimension mismatch."]
+    if not np.all(np.isfinite(w)):
+        return False, ["Weight vector contains NaN or Inf values."]
+
+    w_sum = float(np.sum(w))
+    if abs(w_sum - resolved.budget_sum) > tol:
+        violations.append(f"Budget violation: sum(w)={w_sum:.8f} != {resolved.budget_sum:.8f}.")
+
+    for i, (t, (lo, hi)) in enumerate(zip(resolved.tickers, resolved.bounds)):
+        if w[i] < lo - tol:
+            violations.append(f"Asset '{t}' weight {w[i]:.6f} < min {lo:.6f}.")
+        if w[i] > hi + tol:
+            violations.append(f"Asset '{t}' weight {w[i]:.6f} > max {hi:.6f}.")
+
+    for rc, (lo, hi) in resolved.class_bounds.items():
+        idxs = resolved.class_indices.get(rc, ())
+        cw = float(sum(w[i] for i in idxs))
+        if cw < lo - tol:
+            violations.append(f"Class '{rc}' weight {cw:.6f} < min {lo:.6f}.")
+        if cw > hi + tol:
+            violations.append(f"Class '{rc}' weight {cw:.6f} > max {hi:.6f}.")
+
+    if resolved.max_sector_weight is not None:
+        for sec, idxs in resolved.sector_indices.items():
+            if sec and sec != "Unknown" and len(idxs) >= 1:
+                sw = float(sum(w[i] for i in idxs))
+                if sw > resolved.max_sector_weight + tol:
+                    violations.append(f"Sector '{sec}' weight {sw:.6f} > max {resolved.max_sector_weight:.6f}.")
+
+    if resolved.hhi_limit is not None:
+        hhi = float(np.sum(w * w))
+        if hhi > resolved.hhi_limit + tol:
+            violations.append(f"HHI {hhi:.6f} > limit {resolved.hhi_limit:.6f}.")
+
+    return len(violations) == 0, violations
 
 
-def _optimize_min_variance(mu: pd.Series, cov: pd.DataFrame, stress_bounds=None) -> np.ndarray:
-    n_assets = len(mu)
-    def portfolio_variance(weights):
-        return weights @ cov.values @ weights
-    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
-    bounds = stress_bounds if stress_bounds else tuple((0.05, 0.20) for _ in range(n_assets))
-    initial_guess = np.array([1/n_assets] * n_assets)
-    result = minimize(portfolio_variance, initial_guess, method='SLSQP',
-                     bounds=bounds, constraints=constraints, options={'maxiter': 1000})
-    return result.x if result.success else initial_guess
+def _project_weights_onto_feasible(
+    target_w: np.ndarray,
+    resolved: ResolvedConstraints,
+) -> Tuple[np.ndarray, bool, bool]:
+    """Minimum-distance Euclidean projection of ``target_w`` onto the feasible set (zero Sigma inversion).
 
-
-def _portfolio_metrics(weights: np.ndarray, mu: pd.Series, cov: pd.DataFrame, daily_returns: pd.DataFrame, rf: float) -> dict:
-    ret = weights @ mu.values
-    vol = np.sqrt(weights @ cov.values @ weights)
-    sharpe = (ret - rf) / vol if vol > 0 else 0
-    port_returns = daily_returns.values @ weights
-    cvar = abs(_calc_cvar(port_returns, 0.95))
-    return {'ret': ret, 'vol': vol, 'sharpe': sharpe, 'cvar': cvar}
-
-
-def _calc_mcr(weights: np.ndarray, cov: pd.DataFrame, tickers: List[str]) -> pd.Series:
-    portfolio_variance = weights @ cov.values @ weights
-    portfolio_vol = np.sqrt(portfolio_variance)
-    if portfolio_vol == 0:
-        return pd.Series(np.zeros(len(tickers)), index=tickers)
-    marginal_contrib = (cov.values @ weights) / portfolio_vol
-    mcr = weights * marginal_contrib
-    return pd.Series(mcr, index=tickers)
-
-
-def _calc_historical_performance(prices: pd.DataFrame, weights: np.ndarray, tickers: List[str]) -> pd.Series:
-    prices_subset = prices[tickers].ffill().bfill()
-    portfolio_prices = (prices_subset * weights).sum(axis=1)
-    returns = portfolio_prices.pct_change().fillna(0)
-    cumulative = (1 + returns).cumprod()
-    cumulative = cumulative.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(1)
-    return cumulative
-
-
-def _build_static_figure(mu, port_ret, port_vol, sharpe, output_path):
-    return output_path
-
-def _build_historical_performance_plot(prices, weights_dict, tickers, output_path):
-    return output_path
-
-def _build_correlation_heatmap(prices, tickers, output_path):
-    return output_path
-
-def _build_mcr_chart(mcr_sharpe, mcr_minvar, mcr_cvar, cov, ws, wm, wc, tickers, output_path):
-    return output_path
-
-def _build_real_portfolio_performance(prices, assets, sales, output_path):
-    return output_path
-
-def _build_real_portfolio_with_sales(prices, assets, sales, output_path):
-    return output_path
-
-def _build_real_individual_returns_plot(prices, assets, sales, tickers, output_path):
-    return output_path
-
-def _build_patrimonio_plot(prices, ws, wm, wc, tickers, assets, output_path):
-    return output_path
-
-def _build_portfolio_strategies_performance_plot(prices, ws, wm, wc, tickers, output_path):
-    return output_path
-
-def _build_individual_returns_plot(prices, tickers, output_path):
-    return output_path
-
-
-def _is_existing_portfolio(assets_list: List[dict]) -> bool:
-    for asset in assets_list:
-        if asset.get("mode") == "existing":
-            return True
-        if asset.get("quantity", 0) > 0 and asset.get("buy_price", 0) > 0:
-            return True
-    return False
+    Returns ``(projected_weights, converged, feasible)``.
+    """
+    n = len(resolved.tickers)
+    t_arr = np.asarray(target_w, dtype=float)
+    cons = _build_slsqp_constraints(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+        resolved.budget_sum,
+        resolved.hhi_limit,
+    )
+    res = minimize(
+        lambda w: 0.5 * float(np.sum((w - t_arr) ** 2)),
+        resolved.feasible_starting_point.copy(),
+        jac=lambda w: w - t_arr,
+        method="SLSQP",
+        bounds=resolved.bounds,
+        constraints=cons,
+        options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+    )
+    w_proj = np.asarray(res.x, dtype=float)
+    ok, _ = verify_solution_feasibility(w_proj, resolved)
+    return w_proj, bool(res.success), bool(ok)
 
 
 def _calc_cvar(returns: np.ndarray, confidence: float = 0.95) -> float:
-    var_threshold = np.percentile(returns, (1 - confidence) * 100)
-    cvar = returns[returns <= var_threshold].mean()
-    return cvar if not np.isnan(cvar) else var_threshold
+    arr = np.asarray(returns, dtype=float)
+    if arr.size == 0:
+        return float("nan")
+    var_threshold = float(np.percentile(arr, (1.0 - confidence) * 100.0))
+    tail = arr[arr <= var_threshold]
+    return float(tail.mean()) if tail.size > 0 else var_threshold
 
 
-def _simulate_portfolios(mu: pd.Series, cov: pd.DataFrame, daily_returns: pd.DataFrame, rf: float, samples: int) -> tuple:
-    n_assets = len(mu)
-    weights_array = np.zeros((samples, n_assets))
-    returns_array = np.zeros(samples)
-    volatility_array = np.zeros(samples)
-    cvar_array = np.zeros(samples)
-    for i in range(samples):
-        weights = np.random.random(n_assets)
-        weights /= weights.sum()
-        weights_array[i] = weights
-        returns_array[i] = weights @ mu.values
-        volatility_array[i] = np.sqrt(weights @ cov.values @ weights)
-        port_returns = daily_returns.values @ weights
-        cvar_array[i] = abs(_calc_cvar(port_returns, 0.95))
-    return weights_array, returns_array, volatility_array, cvar_array
-
-
-def analyze_portfolio(assets: Iterable[dict], rf_rate: Optional[float] = None,
-                      samples: int = 2000, dcf_upsides: Optional[dict] = None,
-                      ml_predictions_5y: Optional[dict] = None,
-                      investment_horizon: int = 3, sales: Optional[List[dict]] = None,
-                      country_risk_argentina: Optional[float] = None) -> AnalysisResult:
-    """
-    Pipeline institucional de optimización de portfolio.
-
-    μ_DCF (upside usuario) es sagrado e inmodificable.
-    Si no existe μ_DCF → Black-Litterman (mercado + ML views baja confianza).
-    Σ: Ledoit-Wolf shrinkage + régimen (70/30) + forward-looking (VIX).
-    Post-optimización: stress test con correlaciones = 1.
-    """
-    if rf_rate is None:
-        rf_rate = obtener_tasa_libre_riesgo()
-
-    tickers = sorted({a.get("ticker", "").upper() for a in assets if a.get("ticker")})
-    if not tickers:
-        raise ValueError("No hay tickers para analizar.")
-
-    sales = sales or []
-    assets_list = list(assets)
-    is_existing = _is_existing_portfolio(assets_list)
-
-    if is_existing:
-        buy_dates = []
-        for asset in assets_list:
-            if asset.get("mode") == "existing" and asset.get("buy_date"):
-                buy_dates.append(pd.Timestamp(asset.get("buy_date")))
-        if buy_dates:
-            earliest_date = min(buy_dates)
-            start_download = earliest_date - pd.Timedelta(days=30)
-            prices, dropped = _download_prices(tickers, period="max")
-            if not prices.empty:
-                start_download_tz = pd.Timestamp(start_download)
-                if prices.index.tz is not None:
-                    start_download_tz = start_download_tz.tz_localize('UTC')
-                prices = prices[prices.index >= start_download_tz]
-        else:
-            prices, dropped = _download_prices(tickers, period="10y")
-    else:
-        prices, dropped = _download_prices(tickers, period="10y")
-
-    if prices.empty:
-        raise ValueError("No se pudieron descargar precios para los tickers indicados.")
-
-    available_tickers = [t for t in prices.columns]
-    start_date = prices.index.min() if not prices.empty else None
-    prices_daily = prices.resample('D').last().ffill().bfill()
-
-    prices_daily = prices.resample('D').last().ffill()
-    daily = prices_daily.pct_change(fill_method=None).dropna(how='all')
-    daily = daily.replace([np.inf, -np.inf], 0)
-    available_tickers = list(daily.columns)
-
-    if daily.empty or len(available_tickers) < 2:
-        raise ValueError("No hay retornos suficientes para el análisis.")
-
-    print("\n📐 Construyendo Σ: Ledoit-Wolf + régimen (70% calma / 30% estrés)...")
-    cov, _, _ = regime_adjusted_covariance(daily, stress_weight=0.30, lookback_stress=63)
-
-    vix_current = get_current_vix()
-    cov, cov_inflation = forward_looking_cov_adjustment(cov, vix_current)
-    if cov_inflation > 1.0:
-        print(f"  📊 VIX={vix_current:.1f} → Inflación de covarianza: {cov_inflation:.2f}x")
-    else:
-        print(f"  📊 VIX={'N/A' if vix_current is None else f'{vix_current:.1f}'} → Sin inflación adicional")
-
-    if country_risk_argentina is None:
-        country_risk_argentina = state.prima_riesgo_mas_reciente
-        if country_risk_argentina is not None and country_risk_argentina > 1.0:
-            country_risk_argentina = country_risk_argentina / 100.0
-        elif country_risk_argentina is None:
-            country_risk_argentina = 0.0
-
-    asset_country_risk_map = {}
-    for asset in assets_list:
-        ticker_a = asset.get("ticker", "").upper()
-        pais_riesgo = asset.get("pais_riesgo", asset.get("pais", ""))
-        if ticker_a and pais_riesgo:
-            asset_country_risk_map[ticker_a] = pais_riesgo
-
-    dcf_upsides_clean = {}
-    if dcf_upsides:
-        dcf_upsides_clean = {k.upper(): v for k, v in dcf_upsides.items()
-                             if isinstance(v, (int, float)) and v != 0}
-
-    print("\n📌 Calculando μ: DCF (sagrado) → Black-Litterman (resto)...")
-    mu, mu_source = compute_expected_returns_pipeline(
-        tickers_list=available_tickers,
-        daily_returns=daily,
-        cov_matrix=cov,
-        dcf_upsides=dcf_upsides_clean,
-        ml_predictions_5y=ml_predictions_5y,
-        country_risk_map=asset_country_risk_map,
-        country_risk_value=country_risk_argentina or 0.0
+def compute_risk_contributions(
+    weights: np.ndarray,
+    cov_matrix: pd.DataFrame,
+) -> Tuple[float, pd.Series, pd.Series, pd.Series]:
+    """Compute portfolio volatility, MCR, absolute RC, and relative RC share."""
+    tickers = list(cov_matrix.index)
+    w = np.asarray(weights, dtype=float)
+    sigma = cov_matrix.to_numpy(dtype=float)
+    sw = sigma @ w
+    var_p = float(w @ sw)
+    vol_p = float(np.sqrt(max(var_p, 0.0)))
+    if vol_p <= 1e-14:
+        zeros = pd.Series(np.zeros(len(tickers), dtype=float), index=tickers)
+        return 0.0, zeros.copy(), zeros.copy(), zeros.copy()
+    mcr = sw / vol_p
+    rc_abs = w * mcr
+    rc_rel = rc_abs / vol_p
+    return (
+        vol_p,
+        pd.Series(mcr, index=tickers, dtype=float),
+        pd.Series(rc_abs, index=tickers, dtype=float),
+        pd.Series(rc_rel, index=tickers, dtype=float),
     )
-    for t_src, src in mu_source.items():
-        print(f"  {t_src}: μ={mu[t_src]*100:.2f}% → {src}")
 
-    rf = rf_rate
-    sample_days = daily.shape[0]
 
-    weights, port_ret, port_vol, cvars = _simulate_portfolios(mu, cov, daily, rf, samples)
-    sharpe = (port_ret - rf) / port_vol
+def _calc_mcr(weights: np.ndarray, cov: pd.DataFrame, tickers: List[str]) -> pd.Series:
+    """Return absolute risk contributions ``w_i * (Sigma w)_i / sigma_p``."""
+    _, _, rc_abs, _ = compute_risk_contributions(weights, cov.loc[tickers, tickers])
+    return rc_abs
 
-    print("\n🎯 Optimizando portfolios con restricciones HHI + sectoriales + stress...")
-    sector_map = get_sector_map(available_tickers)
-    stress_bounds = compute_stress_weight_caps(cov, available_tickers)
-    weights_sharpe = optimize_with_sector_and_stress(mu, cov, rf, available_tickers,
-                                                      hhi_limit=0.35, max_sector_weight=0.40,
-                                                      sector_map=sector_map)
-    weights_minvar = _optimize_min_variance(mu, cov, stress_bounds=stress_bounds)
-    weights_cvar = _optimize_min_cvar(mu, cov, daily, stress_bounds=stress_bounds)
-    stats_sharpe = _portfolio_metrics(weights_sharpe, mu, cov, daily, rf)
-    stats_minvar = _portfolio_metrics(weights_minvar, mu, cov, daily, rf)
-    stats_cvar = _portfolio_metrics(weights_cvar, mu, cov, daily, rf)
 
-    mcr_sharpe = _calc_mcr(weights_sharpe, cov, available_tickers)
-    mcr_minvar = _calc_mcr(weights_minvar, cov, available_tickers)
-    mcr_cvar = _calc_mcr(weights_cvar, cov, available_tickers)
+def _assemble_strategy_result(
+    *,
+    strategy_name: str,
+    weights: np.ndarray,
+    resolved: ResolvedConstraints,
+    cov_matrix: pd.DataFrame,
+    mu: Optional[pd.Series] = None,
+    rf: float = 0.0,
+    weekly_returns: Optional[pd.DataFrame] = None,
+    cvar_confidence: float = 0.95,
+    converged: bool = True,
+    status: str = "optimal",
+    diagnostics: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> StrategyAllocationResult:
+    tickers = list(resolved.tickers)
+    cov_ordered = cov_matrix.loc[tickers, tickers]
+    w = np.asarray(weights, dtype=float)
+    feasible, violations = verify_solution_feasibility(w, resolved)
+    warns = list(warnings or [])
+    if not feasible:
+        warns.extend(violations)
+        status = "failed"
 
-    hist_performance = {
-        "sharpe": _calc_historical_performance(prices, weights_sharpe, available_tickers),
-        "minvar": _calc_historical_performance(prices, weights_minvar, available_tickers),
-        "cvar": _calc_historical_performance(prices, weights_cvar, available_tickers),
-    }
+    vol, mcr, rc_abs, rc_rel = compute_risk_contributions(w, cov_ordered)
 
-    chart_path = _build_static_figure(mu, port_ret, port_vol, sharpe,
-                                       Path(tempfile.gettempdir()) / "portfolio_chart.png")
-    weights_dict = {"sharpe": weights_sharpe, "minvar": weights_minvar, "cvar": weights_cvar}
-    historical_perf_chart_path = _build_historical_performance_plot(
-        prices, weights_dict, available_tickers, Path(tempfile.gettempdir()) / "historical_perf_chart.png")
-    correlation_heatmap_path = _build_correlation_heatmap(
-        prices, available_tickers, Path(tempfile.gettempdir()) / "correlation_heatmap.png")
-    mcr_chart_path = _build_mcr_chart(
-        mcr_sharpe, mcr_minvar, mcr_cvar, cov, weights_sharpe, weights_minvar, weights_cvar,
-        available_tickers, Path(tempfile.gettempdir()) / "mcr_chart.png")
+    exp_ret: Optional[float] = None
+    sharpe: Optional[float] = None
+    if mu is not None:
+        mu_aligned = mu.reindex(tickers).to_numpy(dtype=float)
+        if np.all(np.isfinite(mu_aligned)):
+            exp_ret = float(w @ mu_aligned)
+            sharpe = (exp_ret - float(rf)) / vol if vol > 1e-12 else float("nan")
 
-    if is_existing:
-        patrimonio_chart_path = _build_real_portfolio_performance(
-            prices, assets_list, sales, Path(tempfile.gettempdir()) / "patrimonio_chart.png")
-        total_return_chart_path = _build_real_portfolio_with_sales(
-            prices, assets_list, sales, Path(tempfile.gettempdir()) / "total_return_chart.png")
-        individual_returns_chart_path = _build_real_individual_returns_plot(
-            prices, assets_list, sales, available_tickers, Path(tempfile.gettempdir()) / "individual_returns_chart.png")
+    cvar_val: Optional[float] = None
+    if weekly_returns is not None and not weekly_returns.empty:
+        port_ret = weekly_returns[tickers].to_numpy(dtype=float) @ w
+        cvar_val = float(abs(_calc_cvar(port_ret, cvar_confidence)))
+
+    class_exp: Dict[str, float] = {}
+    class_risk_exp: Dict[str, float] = {}
+    for rc, idxs in resolved.class_indices.items():
+        class_exp[rc] = float(sum(w[i] for i in idxs))
+        class_risk_exp[rc] = float(sum(float(rc_rel.iloc[i]) for i in idxs))
+
+    hhi = float(np.sum(w * w))
+    w_dict = {t: float(val) for t, val in zip(tickers, w)}
+
+    return StrategyAllocationResult(
+        strategy_name=strategy_name,
+        tickers=tickers,
+        weights=w,
+        weights_by_asset=w_dict,
+        converged=bool(converged),
+        feasible=feasible,
+        status=status,
+        expected_return=exp_ret,
+        volatility=vol,
+        sharpe_ratio=sharpe,
+        cvar_95=cvar_val,
+        marginal_risk_contributions=mcr,
+        risk_contributions_abs=rc_abs,
+        risk_contributions_rel=rc_rel,
+        class_exposure=class_exp,
+        class_risk_exposure=class_risk_exp,
+        hhi=hhi,
+        diagnostics=dict(diagnostics or {}),
+        warnings=warns,
+    )
+
+
+def _compute_max_feasible_excess_return(
+    mu_arr: np.ndarray,
+    rf: float,
+    resolved: ResolvedConstraints,
+) -> float:
+    """Compute exact maximum achievable excess return ``max_{w in F} (w' mu - rf)`` under ALL constraints."""
+    n = len(resolved.tickers)
+    excess_vec = mu_arr - float(rf)
+    A_ub, b_ub = _build_linear_ineq_matrices(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+    )
+    A_eq = np.ones((1, n), dtype=float)
+    b_eq = np.array([resolved.budget_sum], dtype=float)
+    lp_res = linprog(
+        c=-excess_vec,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        bounds=resolved.bounds,
+        method="highs",
+        options={
+            "primal_feasibility_tolerance": min(float(resolved.feasibility_tolerance), 1e-7),
+            "dual_feasibility_tolerance": min(float(resolved.solver_tolerance), 1e-7),
+        },
+    )
+    if not lp_res.success or lp_res.x is None:
+        return float(resolved.feasible_starting_point @ excess_vec)
+
+    w_lp = np.asarray(lp_res.x, dtype=float)
+    if resolved.hhi_limit is None or float(np.sum(w_lp * w_lp)) <= resolved.hhi_limit + resolved.feasibility_tolerance:
+        return float(w_lp @ excess_vec)
+
+    cons = _build_slsqp_constraints(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+        resolved.budget_sum,
+        resolved.hhi_limit,
+    )
+    res_hhi = minimize(
+        lambda w: -float(w @ excess_vec),
+        resolved.feasible_starting_point.copy(),
+        jac=lambda w: -excess_vec,
+        method="SLSQP",
+        bounds=resolved.bounds,
+        constraints=cons,
+        options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+    )
+    ok_hhi, _ = verify_solution_feasibility(res_hhi.x, resolved)
+    if res_hhi.success and ok_hhi:
+        return float(np.asarray(res_hhi.x, dtype=float) @ excess_vec)
+    return float(resolved.feasible_starting_point @ excess_vec)
+
+
+_EXCESS_RETURN_ZERO_TOL = 1e-12
+
+
+def optimize_max_sharpe(
+    mu: pd.Series,
+    cov_matrix: pd.DataFrame,
+    rf: float,
+    resolved: ResolvedConstraints,
+    *,
+    weekly_returns: Optional[pd.DataFrame] = None,
+    cvar_confidence: float = 0.95,
+    non_positive_excess_return_policy: str = "block",
+) -> StrategyAllocationResult:
+    """Maximize Sharpe ratio over the exact feasible set with strict convergence & edge-case guards."""
+    tickers = list(resolved.tickers)
+    n = len(tickers)
+    mu_arr = mu.reindex(tickers).to_numpy(dtype=float)
+    sigma = cov_matrix.loc[tickers, tickers].to_numpy(dtype=float)
+    if not np.all(np.isfinite(mu_arr)) or not np.all(np.isfinite(sigma)):
+        raise OptimizationConvergenceError(
+            "Max Sharpe inputs contain non-finite expected returns or covariance entries.",
+            details={"strategy": "max_sharpe"},
+        )
+
+    if non_positive_excess_return_policy not in ("block", "allow_with_warning"):
+        raise ConfigurationError(
+            f"Invalid non_positive_excess_return_policy '{non_positive_excess_return_policy}'."
+        )
+
+    vol_zero_tol = 1e-8
+
+    if n == 1:
+        w1 = np.array([float(resolved.budget_sum)], dtype=float)
+        ok1, viol1 = verify_solution_feasibility(w1, resolved)
+        if not ok1:
+            raise OptimizationConvergenceError(
+                "Single-asset Max Sharpe allocation is infeasible under active constraints: " + "; ".join(viol1),
+                details={"strategy": "max_sharpe", "n_assets": 1, "violations": viol1},
+            )
+        var1 = float(sigma[0, 0])
+        if var1 < -1e-12:
+            raise OptimizationConvergenceError(
+                f"Single-asset covariance entry is negative ({var1:.3e}); invalid covariance matrix.",
+                details={"strategy": "max_sharpe", "n_assets": 1, "variance": var1},
+            )
+        vol1 = math.sqrt(max(var1, 0.0))
+        excess1 = float(w1[0] * mu_arr[0]) - float(rf)
+        if vol1 <= vol_zero_tol:
+            return _assemble_strategy_result(
+                strategy_name="max_sharpe",
+                weights=w1,
+                resolved=resolved,
+                cov_matrix=cov_matrix,
+                mu=mu,
+                rf=rf,
+                weekly_returns=weekly_returns,
+                cvar_confidence=cvar_confidence,
+                converged=False,
+                status="singular_zero_variance",
+                diagnostics={
+                    "n_assets": 1,
+                    "solver": "single_asset_exact",
+                    "zero_variance_detected": True,
+                    "max_feasible_excess_return": excess1,
+                    "policy": non_positive_excess_return_policy,
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
+                warnings=["Single-asset variance is zero; Sharpe ratio denominator is undefined."],
+            )
+        if excess1 <= _EXCESS_RETURN_ZERO_TOL:
+            if non_positive_excess_return_policy == "block":
+                return _assemble_strategy_result(
+                    strategy_name="max_sharpe",
+                    weights=w1,
+                    resolved=resolved,
+                    cov_matrix=cov_matrix,
+                    mu=mu,
+                    rf=rf,
+                    weekly_returns=weekly_returns,
+                    cvar_confidence=cvar_confidence,
+                    converged=False,
+                    status="blocked_non_positive_excess",
+                    diagnostics={
+                        "n_assets": 1,
+                        "solver": "exact_excess_return_gate",
+                        "max_feasible_excess_return": excess1,
+                        "policy": "block",
+                        "is_valid_target": False,
+                        "solver_tolerance": resolved.solver_tolerance,
+                    },
+                    warnings=[
+                        f"Single-asset expected excess return is {excess1:.6%} (<= 0%); "
+                        "Max Sharpe is blocked under non_positive_excess_return_policy='block'."
+                    ],
+                )
+            return _assemble_strategy_result(
+                strategy_name="max_sharpe",
+                weights=w1,
+                resolved=resolved,
+                cov_matrix=cov_matrix,
+                mu=mu,
+                rf=rf,
+                weekly_returns=weekly_returns,
+                cvar_confidence=cvar_confidence,
+                converged=True,
+                status="suboptimal_non_positive_excess",
+                diagnostics={
+                    "n_assets": 1,
+                    "solver": "single_asset_exact",
+                    "max_feasible_excess_return": excess1,
+                    "policy": "allow_with_warning",
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
+                warnings=[
+                    f"Single-asset expected excess return is {excess1:.6%} (<= 0%); "
+                    "Sharpe ratio is non-positive and marked suboptimal_non_positive_excess "
+                    "(explicitly permitted for diagnostics via policy='allow_with_warning', not approved as a rebalancing target)."
+                ],
+            )
+        return _assemble_strategy_result(
+            strategy_name="max_sharpe",
+            weights=w1,
+            resolved=resolved,
+            cov_matrix=cov_matrix,
+            mu=mu,
+            rf=rf,
+            weekly_returns=weekly_returns,
+            cvar_confidence=cvar_confidence,
+            diagnostics={
+                "n_assets": 1,
+                "solver": "single_asset_exact",
+                "max_feasible_excess_return": excess1,
+                "policy": non_positive_excess_return_policy,
+                "note": "Single-asset unique feasible allocation.",
+                "is_valid_target": True,
+                "solver_tolerance": resolved.solver_tolerance,
+            },
+        )
+
+    # 1. Exact check of maximum feasible excess return under ALL active constraints (AUD-05)
+    max_feasible_excess = _compute_max_feasible_excess_return(mu_arr, rf, resolved)
+    non_positive_excess = max_feasible_excess <= _EXCESS_RETURN_ZERO_TOL
+    warnings_list: List[str] = []
+
+    if non_positive_excess:
+        if non_positive_excess_return_policy == "block":
+            return _assemble_strategy_result(
+                strategy_name="max_sharpe",
+                weights=resolved.feasible_starting_point.copy(),
+                resolved=resolved,
+                cov_matrix=cov_matrix,
+                mu=mu,
+                rf=rf,
+                weekly_returns=weekly_returns,
+                cvar_confidence=cvar_confidence,
+                converged=False,
+                status="blocked_non_positive_excess",
+                diagnostics={
+                    "solver": "exact_excess_return_gate",
+                    "max_feasible_excess_return": max_feasible_excess,
+                    "policy": "block",
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
+                warnings=[
+                    f"Maximum feasible excess return under active constraints is {max_feasible_excess:.6%} (<= 0%). "
+                    "Max Sharpe is blocked to prevent degenerate concentration in maximum volatility; "
+                    "use min_variance/erc/hrp or opt in via non_positive_excess_return_policy='allow_with_warning'."
+                ],
+            )
+        warnings_list.append(
+            f"Maximum feasible excess return under active constraints is {max_feasible_excess:.6%} (<= 0%); "
+            "maximizing a negative Sharpe ratio favors higher volatility (explicitly permitted via policy='allow_with_warning')."
+        )
+
+    cons = _build_slsqp_constraints(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+        resolved.budget_sum,
+        resolved.hhi_limit,
+    )
+
+    # 2. Detect singular / zero-variance feasible portfolio before running Sharpe optimization (AUD-05)
+    eigvals = np.linalg.eigvalsh(0.5 * (sigma + sigma.T))
+    if float(np.min(eigvals)) <= 1e-10:
+        mv_probe = minimize(
+            lambda w: float(w @ sigma @ w),
+            resolved.feasible_starting_point.copy(),
+            jac=lambda w: 2.0 * (sigma @ w),
+            method="SLSQP",
+            bounds=resolved.bounds,
+            constraints=cons,
+            options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+        )
+        ok_mv, _ = verify_solution_feasibility(mv_probe.x, resolved)
+        if ok_mv:
+            w_mv = np.asarray(mv_probe.x, dtype=float)
+            vol_mv = math.sqrt(max(float(w_mv @ sigma @ w_mv), 0.0))
+            if vol_mv <= vol_zero_tol:
+                ex_mv = float(w_mv @ mu_arr) - float(rf)
+                if ex_mv > 1e-12 or abs(ex_mv) <= 1e-12:
+                    return _assemble_strategy_result(
+                        strategy_name="max_sharpe",
+                        weights=w_mv,
+                        resolved=resolved,
+                        cov_matrix=cov_matrix,
+                        mu=mu,
+                        rf=rf,
+                        weekly_returns=weekly_returns,
+                        cvar_confidence=cvar_confidence,
+                        converged=False,
+                        status="singular_zero_variance",
+                        diagnostics={
+                            "solver": "zero_variance_singularity_guard",
+                            "min_feasible_volatility": vol_mv,
+                            "excess_at_zero_vol": ex_mv,
+                            "zero_variance_detected": True,
+                            "is_valid_target": False,
+                            "solver_tolerance": resolved.solver_tolerance,
+                        },
+                        warnings=warnings_list + [
+                            f"Singular covariance admits a feasible zero-volatility portfolio (vol={vol_mv:.3e}, excess={ex_mv:.4%}); "
+                            "Sharpe ratio denominator is zero (undefined / theoretical arbitrage). Refusing spurious optimal status."
+                        ],
+                    )
+
+    # 3. Objective without artificial volatility floor rewarding vol -> 0
+    def neg_sharpe_and_grad(w: np.ndarray) -> Tuple[float, np.ndarray]:
+        sw = sigma @ w
+        var = float(w @ sw)
+        if var <= vol_zero_tol * vol_zero_tol:
+            return 1e12, np.zeros(n, dtype=float)
+        vol = math.sqrt(var)
+        excess = float(w @ mu_arr) - float(rf)
+        obj = -excess / vol
+        grad = -(mu_arr * vol - excess * (sw / vol)) / var
+        return obj, grad
+
+    starts = [resolved.feasible_starting_point.copy()]
+    indiv_vols = np.sqrt(np.maximum(np.diag(sigma), 1e-12))
+    indiv_sharpes = (mu_arr - float(rf)) / indiv_vols
+    best_idx = int(np.argmax(indiv_sharpes))
+    e_best = np.zeros(n, dtype=float)
+    e_best[best_idx] = 1.0
+    proj_best, conv_proj, ok_proj = _project_weights_onto_feasible(e_best, resolved)
+    if conv_proj and ok_proj:
+        starts.append(proj_best)
+
+    best_conv_w: Optional[np.ndarray] = None
+    best_conv_obj = float("inf")
+    best_conv_nit = 0
+
+    best_nonconv_w: Optional[np.ndarray] = None
+    best_nonconv_obj = float("inf")
+    best_nonconv_msg = ""
+
+    for w0 in starts:
+        res = minimize(
+            lambda w: neg_sharpe_and_grad(w)[0],
+            w0,
+            jac=lambda w: neg_sharpe_and_grad(w)[1],
+            method="SLSQP",
+            bounds=resolved.bounds,
+            constraints=cons,
+            options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+        )
+        w_cand = np.asarray(res.x, dtype=float)
+        ok, _ = verify_solution_feasibility(w_cand, resolved)
+        if not ok:
+            continue
+        var_c = float(w_cand @ sigma @ w_cand)
+        vol_c = math.sqrt(max(var_c, 0.0))
+        if vol_c <= vol_zero_tol:
+            return _assemble_strategy_result(
+                strategy_name="max_sharpe",
+                weights=w_cand,
+                resolved=resolved,
+                cov_matrix=cov_matrix,
+                mu=mu,
+                rf=rf,
+                weekly_returns=weekly_returns,
+                cvar_confidence=cvar_confidence,
+                converged=False,
+                status="singular_zero_variance",
+                diagnostics={
+                    "solver": "SLSQP",
+                    "zero_variance_detected": True,
+                    "is_valid_target": False,
+                    "solver_tolerance": resolved.solver_tolerance,
+                },
+                warnings=warnings_list + [
+                    f"Max Sharpe reached a zero-volatility portfolio (vol={vol_c:.3e}); Sharpe ratio is undefined."
+                ],
+            )
+        val = neg_sharpe_and_grad(w_cand)[0]
+        if not math.isfinite(val):
+            continue
+        if bool(res.success):
+            if val < best_conv_obj:
+                best_conv_obj = val
+                best_conv_w = w_cand
+                best_conv_nit = int(getattr(res, "nit", 0))
+        else:
+            if val < best_nonconv_obj:
+                best_nonconv_obj = val
+                best_nonconv_w = w_cand
+                best_nonconv_msg = str(getattr(res, "message", "SLSQP failed to converge"))
+
+    if best_conv_w is None:
+        if best_nonconv_w is not None:
+            return _assemble_strategy_result(
+                strategy_name="max_sharpe",
+                weights=best_nonconv_w,
+                resolved=resolved,
+                cov_matrix=cov_matrix,
+                mu=mu,
+                rf=rf,
+                weekly_returns=weekly_returns,
+                cvar_confidence=cvar_confidence,
+                converged=False,
+                status="non_converged",
+                diagnostics={
+                    "solver": "SLSQP",
+                    "solver_message": best_nonconv_msg,
+                    "solver_tolerance": resolved.solver_tolerance,
+                    "is_valid_target": False,
+                },
+                warnings=warnings_list + [
+                    f"Max Sharpe SLSQP did not converge ({best_nonconv_msg}); feasible candidate retained for diagnostics only and is NOT optimal."
+                ],
+            )
+        raise OptimizationConvergenceError(
+            "Max Sharpe optimizer failed to converge to a feasible solution within tolerance.",
+            details={"strategy": "max_sharpe", "n_assets": n},
+        )
+
+    final_status = "suboptimal_non_positive_excess" if non_positive_excess else "optimal"
+    return _assemble_strategy_result(
+        strategy_name="max_sharpe",
+        weights=best_conv_w,
+        resolved=resolved,
+        cov_matrix=cov_matrix,
+        mu=mu,
+        rf=rf,
+        weekly_returns=weekly_returns,
+        cvar_confidence=cvar_confidence,
+        converged=True,
+        status=final_status,
+        diagnostics={
+            "solver": "SLSQP",
+            "iterations": best_conv_nit,
+            "max_feasible_excess_return": max_feasible_excess,
+            "policy": non_positive_excess_return_policy,
+            "solver_tolerance": resolved.solver_tolerance,
+            "is_valid_target": not non_positive_excess,
+        },
+        warnings=warnings_list,
+    )
+
+
+def optimize_min_variance(
+    cov_matrix: pd.DataFrame,
+    resolved: ResolvedConstraints,
+    *,
+    mu: Optional[pd.Series] = None,
+    rf: float = 0.0,
+    weekly_returns: Optional[pd.DataFrame] = None,
+    cvar_confidence: float = 0.95,
+) -> StrategyAllocationResult:
+    """Minimize portfolio variance ``w' Sigma w`` over the exact feasible set."""
+    tickers = list(resolved.tickers)
+    n = len(tickers)
+    sigma = cov_matrix.loc[tickers, tickers].to_numpy(dtype=float)
+
+    if n == 1:
+        return _assemble_strategy_result(
+            strategy_name="min_variance",
+            weights=np.array([1.0], dtype=float),
+            resolved=resolved,
+            cov_matrix=cov_matrix,
+            mu=mu,
+            rf=rf,
+            weekly_returns=weekly_returns,
+            cvar_confidence=cvar_confidence,
+            diagnostics={"n_assets": 1, "is_valid_target": True},
+        )
+
+    cons = _build_slsqp_constraints(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+        resolved.budget_sum,
+        resolved.hhi_limit,
+    )
+    res = minimize(
+        lambda w: float(w @ sigma @ w),
+        resolved.feasible_starting_point.copy(),
+        jac=lambda w: 2.0 * (sigma @ w),
+        method="SLSQP",
+        bounds=resolved.bounds,
+        constraints=cons,
+        options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+    )
+    w_sol = np.asarray(res.x, dtype=float)
+    ok, violations = verify_solution_feasibility(w_sol, resolved)
+    if not ok:
+        raise OptimizationConvergenceError(
+            "Min Variance optimizer failed to produce a feasible solution: " + "; ".join(violations),
+            details={"strategy": "min_variance", "solver_message": str(getattr(res, "message", ""))},
+        )
+
+    converged = bool(res.success)
+    status = "optimal" if converged else "non_converged"
+    warnings_list: List[str] = []
+    if not converged:
+        warnings_list.append(
+            f"Min Variance SLSQP did not converge ({getattr(res, 'message', '')}); feasible candidate retained for diagnostics only and is NOT optimal."
+        )
+
+    return _assemble_strategy_result(
+        strategy_name="min_variance",
+        weights=w_sol,
+        resolved=resolved,
+        cov_matrix=cov_matrix,
+        mu=mu,
+        rf=rf,
+        weekly_returns=weekly_returns,
+        cvar_confidence=cvar_confidence,
+        converged=converged,
+        status=status,
+        diagnostics={
+            "solver": "SLSQP",
+            "iterations": int(getattr(res, "nit", 0)),
+            "solver_tolerance": resolved.solver_tolerance,
+            "solver_message": str(getattr(res, "message", "")),
+            "is_valid_target": converged,
+        },
+        warnings=warnings_list,
+    )
+
+
+def optimize_min_cvar(
+    weekly_returns: pd.DataFrame,
+    cov_matrix: pd.DataFrame,
+    resolved: ResolvedConstraints,
+    *,
+    mu: Optional[pd.Series] = None,
+    rf: float = 0.0,
+    cvar_confidence: float = 0.95,
+) -> StrategyAllocationResult:
+    """Minimize historical weekly CVaR via exact Rockafellar-Uryasev LP (plus optional HHI refinement)."""
+    tickers = list(resolved.tickers)
+    n = len(tickers)
+
+    if n == 1:
+        return _assemble_strategy_result(
+            strategy_name="min_cvar",
+            weights=np.array([1.0], dtype=float),
+            resolved=resolved,
+            cov_matrix=cov_matrix,
+            mu=mu,
+            rf=rf,
+            weekly_returns=weekly_returns,
+            cvar_confidence=cvar_confidence,
+            diagnostics={"n_assets": 1, "is_valid_target": True},
+        )
+
+    R = weekly_returns[tickers].to_numpy(dtype=float)
+    T = R.shape[0]
+    alpha = float(cvar_confidence)
+    denom = (1.0 - alpha) * T
+
+    c = np.zeros(n + 1 + T, dtype=float)
+    c[n] = 1.0
+    c[n + 1 :] = 1.0 / denom
+
+    A_loss = np.zeros((T, n + 1 + T), dtype=float)
+    A_loss[:, :n] = -R
+    A_loss[:, n] = -1.0
+    A_loss[:, n + 1 :] = -np.eye(T, dtype=float)
+    b_loss = np.zeros(T, dtype=float)
+
+    A_lin, b_lin = _build_linear_ineq_matrices(
+        n,
+        resolved.class_indices,
+        resolved.class_bounds,
+        resolved.sector_indices,
+        resolved.max_sector_weight,
+    )
+    if A_lin is not None and b_lin is not None:
+        A_extra = np.zeros((A_lin.shape[0], n + 1 + T), dtype=float)
+        A_extra[:, :n] = A_lin
+        A_ub = np.vstack([A_loss, A_extra])
+        b_ub = np.concatenate([b_loss, b_lin])
     else:
-        patrimonio_chart_path = _build_patrimonio_plot(
-            prices, weights_sharpe, weights_minvar, weights_cvar, available_tickers, assets_list,
-            Path(tempfile.gettempdir()) / "patrimonio_chart.png")
-        total_return_chart_path = _build_portfolio_strategies_performance_plot(
-            prices, weights_sharpe, weights_minvar, weights_cvar, available_tickers,
-            Path(tempfile.gettempdir()) / "total_return_chart.png")
-        individual_returns_chart_path = _build_individual_returns_plot(
-            prices, available_tickers, Path(tempfile.gettempdir()) / "individual_returns_chart.png")
+        A_ub = A_loss
+        b_ub = b_loss
 
-    print("\n🔴 Stress test (correlaciones = 1)...")
-    stress_sharpe = stress_test_corr_one(weights_sharpe, cov, available_tickers)
-    stress_minvar = stress_test_corr_one(weights_minvar, cov, available_tickers)
-    stress_cvar = stress_test_corr_one(weights_cvar, cov, available_tickers)
-    stress_results = {'sharpe': stress_sharpe, 'minvar': stress_minvar, 'cvar': stress_cvar}
-    for st_name, st in [('Sharpe', stress_sharpe), ('MinVar', stress_minvar), ('CVaR', stress_cvar)]:
-        print(f"  {st_name}: Vol {st['normal_vol']*100:.2f}%→{st['stress_vol']*100:.2f}% "
-              f"(+{st['vol_increase_pct']:.1f}%) Diversif={st['diversification_ratio']:.3f}")
-        if st['false_diversification']:
-            for rec in st['recommendations']:
-                print(f"    ⚠️ {rec}")
+    A_eq = np.zeros((1, n + 1 + T), dtype=float)
+    A_eq[0, :n] = 1.0
+    b_eq = np.array([resolved.budget_sum], dtype=float)
+
+    lp_bounds: List[Tuple[Optional[float], Optional[float]]] = list(resolved.bounds)
+    lp_bounds.append((None, None))
+    lp_bounds.extend([(0.0, None)] * T)
+
+    lp_res = linprog(
+        c=c,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        bounds=lp_bounds,
+        method="highs",
+        options={
+            "primal_feasibility_tolerance": min(float(resolved.feasibility_tolerance), 1e-7),
+            "dual_feasibility_tolerance": min(float(resolved.solver_tolerance), 1e-7),
+        },
+    )
+    if not lp_res.success or lp_res.x is None:
+        raise OptimizationConvergenceError(
+            f"Min CVaR LP solver failed: {lp_res.message}",
+            details={"strategy": "min_cvar"},
+        )
+    w_sol = np.asarray(lp_res.x[:n], dtype=float)
+
+    solver_used = "rockafellar_uryasev_lp"
+    converged = True
+    warnings_list: List[str] = []
+    solver_msg = str(getattr(lp_res, "message", ""))
+
+    if resolved.hhi_limit is not None and float(np.sum(w_sol * w_sol)) > resolved.hhi_limit + resolved.feasibility_tolerance:
+        solver_used = "rockafellar_uryasev_slsqp_hhi"
+        w0 = resolved.feasible_starting_point.copy()
+        zeta0 = float(np.percentile(-(R @ w0), alpha * 100.0))
+        x0 = np.concatenate([w0, [zeta0]])
+
+        def ru_obj(x: np.ndarray) -> float:
+            w = x[:n]
+            zeta = x[n]
+            excess = np.maximum(-(R @ w) - zeta, 0.0)
+            return float(zeta + np.sum(excess) / denom)
+
+        base_cons = _build_slsqp_constraints(
+            n,
+            resolved.class_indices,
+            resolved.class_bounds,
+            resolved.sector_indices,
+            resolved.max_sector_weight,
+            resolved.budget_sum,
+            resolved.hhi_limit,
+        )
+        ext_cons = []
+        for con in base_cons:
+            ext_cons.append({
+                "type": con["type"],
+                "fun": lambda x, f=con["fun"]: f(x[:n]),
+                "jac": lambda x, j=con["jac"]: np.concatenate([j(x[:n]), [0.0]]),
+            })
+        ext_bounds = list(resolved.bounds) + [(None, None)]
+        res = minimize(
+            ru_obj,
+            x0,
+            method="SLSQP",
+            bounds=ext_bounds,
+            constraints=ext_cons,
+            options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+        )
+        w_sol = np.asarray(res.x[:n], dtype=float)
+        converged = bool(res.success)
+        solver_msg = str(getattr(res, "message", ""))
+        if not converged:
+            warnings_list.append(
+                f"Min CVaR HHI SLSQP did not converge ({solver_msg}); feasible candidate retained for diagnostics only and is NOT optimal."
+            )
+
+    ok, violations = verify_solution_feasibility(w_sol, resolved)
+    if not ok:
+        raise OptimizationConvergenceError(
+            "Min CVaR solution failed feasibility verification: " + "; ".join(violations),
+            details={"strategy": "min_cvar", "solver_message": solver_msg},
+        )
+
+    status = "optimal" if converged else "non_converged"
+    return _assemble_strategy_result(
+        strategy_name="min_cvar",
+        weights=w_sol,
+        resolved=resolved,
+        cov_matrix=cov_matrix,
+        mu=mu,
+        rf=rf,
+        weekly_returns=weekly_returns,
+        cvar_confidence=cvar_confidence,
+        converged=converged,
+        status=status,
+        diagnostics={
+            "solver": solver_used,
+            "confidence": alpha,
+            "solver_tolerance": resolved.solver_tolerance,
+            "solver_message": solver_msg,
+            "is_valid_target": converged,
+        },
+        warnings=warnings_list,
+    )
+
+
+def _solve_unconstrained_erc_spinu(
+    sigma: np.ndarray,
+    *,
+    solver_tolerance: float = 1e-8,
+) -> Tuple[np.ndarray, bool]:
+    """Solve unconstrained long-only ERC via Spinu (2013) strictly convex log-barrier formulation."""
+    n = sigma.shape[0]
+    vols = np.sqrt(np.maximum(np.diag(sigma), 1e-12))
+    y0 = (1.0 / vols) / np.sum(1.0 / vols)
+    z0 = np.log(np.maximum(y0, 1e-12))
+    inv_n = 1.0 / n
+
+    def obj_and_grad(z: np.ndarray) -> Tuple[float, np.ndarray]:
+        z_clipped = np.clip(z, -40.0, 40.0)
+        y = np.exp(z_clipped)
+        sy = sigma @ y
+        val = 0.5 * float(y @ sy) - inv_n * float(np.sum(z_clipped))
+        grad = y * sy - inv_n
+        return val, grad
+
+    res = minimize(
+        lambda z: obj_and_grad(z)[0],
+        z0,
+        jac=lambda z: obj_and_grad(z)[1],
+        method="L-BFGS-B",
+        options={"maxiter": 2000, "ftol": solver_tolerance, "gtol": solver_tolerance},
+    )
+    y_opt = np.exp(np.clip(res.x, -40.0, 40.0))
+    w_opt = y_opt / np.sum(y_opt)
+    return w_opt, bool(res.success and np.all(np.isfinite(w_opt)))
+
+
+def optimize_erc(
+    cov_matrix: pd.DataFrame,
+    resolved: ResolvedConstraints,
+    *,
+    mu: Optional[pd.Series] = None,
+    rf: float = 0.0,
+    weekly_returns: Optional[pd.DataFrame] = None,
+    cvar_confidence: float = 0.95,
+    exact_parity_tolerance: float = 1e-4,
+) -> StrategyAllocationResult:
+    """Compute Equal Risk Contribution (ERC / Risk Parity) portfolio without requiring ``mu``."""
+    tickers = list(resolved.tickers)
+    n = len(tickers)
+    cov_ordered = cov_matrix.loc[tickers, tickers]
+    cov_psd, psd_adj, min_b, min_a = ensure_psd_covariance(cov_ordered)
+    sigma = cov_psd.to_numpy(dtype=float)
 
     warnings_list: List[str] = []
-    if dropped:
-        warnings_list.append(f"Tickers sin datos: {', '.join(dropped)}")
-    if daily.shape[0] < 250:
-        warnings_list.append("La serie histórica es corta; los resultados pueden ser inestables.")
-    for stn, std in stress_results.items():
-        if std.get('false_diversification'):
-            warnings_list.append(f"Stress test ({stn}): Falsa diversificación (ratio={std['diversification_ratio']:.3f})")
+    if psd_adj:
+        warnings_list.append(
+            f"ERC input covariance required PSD adjustment (min eig {min_b:.3e} -> {min_a:.3e})."
+        )
 
-    return AnalysisResult(
-        tickers=available_tickers,
-        expected_returns=mu,
-        cov_matrix=cov,
-        weights_sharpe=weights_sharpe,
-        weights_minvar=weights_minvar,
-        weights_cvar=weights_cvar,
-        chart_path=chart_path,
+    if n == 1:
+        return _assemble_strategy_result(
+            strategy_name="erc",
+            weights=np.array([1.0], dtype=float),
+            resolved=resolved,
+            cov_matrix=cov_psd,
+            mu=mu,
+            rf=rf,
+            weekly_returns=weekly_returns,
+            cvar_confidence=cvar_confidence,
+            diagnostics={
+                "solver": "single_asset",
+                "target_risk_share": 1.0,
+                "max_risk_share_deviation": 0.0,
+                "risk_share_std": 0.0,
+                "has_negative_risk_contributions": False,
+                "is_constrained_erc": False,
+                "is_valid_target": True,
+            },
+            warnings=warnings_list,
+        )
+
+    target_share = 1.0 / n
+
+    w_spinu, spinu_ok = _solve_unconstrained_erc_spinu(sigma, solver_tolerance=resolved.solver_tolerance)
+    spinu_feasible, _ = verify_solution_feasibility(w_spinu, resolved) if spinu_ok else (False, ["spinu_failed"])
+
+    solver_used = "spinu_convex_exact"
+    best_w: Optional[np.ndarray] = None
+    converged = False
+    solver_msg = ""
+
+    if spinu_ok and spinu_feasible:
+        vol_s, _, _, rc_rel_s = compute_risk_contributions(w_spinu, cov_psd)
+        if vol_s > 1e-12 and float(np.max(np.abs(rc_rel_s.to_numpy() - target_share))) <= exact_parity_tolerance:
+            best_w = w_spinu
+            converged = True
+
+    if best_w is None:
+        solver_used = "slsqp_constrained_risk_dispersion"
+
+        def dispersion_obj_and_grad(w: np.ndarray) -> Tuple[float, np.ndarray]:
+            sw = sigma @ w
+            var = float(w @ sw)
+            if var <= 1e-18:
+                return 1e6, np.zeros(n, dtype=float)
+            rc_rel = (w * sw) / var
+            diff = rc_rel - target_share
+            obj = float(np.sum(diff * diff))
+            term1 = (diff * sw) / var
+            term2 = (sigma @ (diff * w)) / var
+            term3 = -2.0 * float(np.sum(diff * rc_rel)) * sw / var
+            grad = 2.0 * (term1 + term2 + term3)
+            return obj, grad
+
+        cons = _build_slsqp_constraints(
+            n,
+            resolved.class_indices,
+            resolved.class_bounds,
+            resolved.sector_indices,
+            resolved.max_sector_weight,
+            resolved.budget_sum,
+            resolved.hhi_limit,
+        )
+
+        starts: List[np.ndarray] = [resolved.feasible_starting_point.copy()]
+        if spinu_ok:
+            w_proj_s, conv_s, ok_s = _project_weights_onto_feasible(w_spinu, resolved)
+            if conv_s and ok_s:
+                starts.insert(0, w_proj_s)
+        vols = np.sqrt(np.maximum(np.diag(sigma), 1e-12))
+        w_iv = (1.0 / vols) / np.sum(1.0 / vols)
+        w_proj_iv, conv_iv, ok_iv = _project_weights_onto_feasible(w_iv, resolved)
+        if conv_iv and ok_iv:
+            starts.append(w_proj_iv)
+
+        best_conv_w: Optional[np.ndarray] = None
+        best_conv_val = float("inf")
+        best_nonconv_w: Optional[np.ndarray] = None
+        best_nonconv_val = float("inf")
+
+        for w0 in starts:
+            res = minimize(
+                lambda w: dispersion_obj_and_grad(w)[0],
+                w0,
+                jac=lambda w: dispersion_obj_and_grad(w)[1],
+                method="SLSQP",
+                bounds=resolved.bounds,
+                constraints=cons,
+                options={"maxiter": 2000, "ftol": resolved.solver_tolerance},
+            )
+            w_cand = np.asarray(res.x, dtype=float)
+            ok, _ = verify_solution_feasibility(w_cand, resolved)
+            if not ok:
+                continue
+            val = dispersion_obj_and_grad(w_cand)[0]
+            if not math.isfinite(val):
+                continue
+            if bool(res.success):
+                if val < best_conv_val:
+                    best_conv_val = val
+                    best_conv_w = w_cand
+            else:
+                if val < best_nonconv_val:
+                    best_nonconv_val = val
+                    best_nonconv_w = w_cand
+                    solver_msg = str(getattr(res, "message", "SLSQP failed to converge"))
+
+        if best_conv_w is not None:
+            best_w = best_conv_w
+            converged = True
+        elif best_nonconv_w is not None:
+            best_w = best_nonconv_w
+            converged = False
+            warnings_list.append(
+                f"Constrained ERC SLSQP did not converge ({solver_msg}); feasible candidate retained for diagnostics only and is NOT optimal."
+            )
+
+    if best_w is None:
+        raise OptimizationConvergenceError(
+            "ERC optimizer failed to converge to a feasible solution within tolerance.",
+            details={"strategy": "erc", "n_assets": n},
+        )
+
+    vol, _, _, rc_rel = compute_risk_contributions(best_w, cov_psd)
+    if vol <= 1e-12:
+        raise OptimizationConvergenceError(
+            "ERC produced zero portfolio volatility (degenerate covariance).",
+            details={"strategy": "erc"},
+        )
+
+    rc_arr = rc_rel.to_numpy(dtype=float)
+    max_dev = float(np.max(np.abs(rc_arr - target_share)))
+    std_rc = float(np.std(rc_arr))
+    has_neg_rc = bool(np.any(rc_arr < -1e-9))
+
+    if has_neg_rc:
+        neg_assets = [tickers[i] for i in range(n) if rc_arr[i] < -1e-9]
+        warnings_list.append(
+            f"Negative risk contribution(s) detected in ERC solution for {neg_assets} (hedge correlation structure)."
+        )
+
+    is_constrained = max_dev > exact_parity_tolerance
+    if not converged:
+        status = "non_converged"
+    else:
+        status = "constrained_approximate" if is_constrained else "optimal"
+        if is_constrained:
+            warnings_list.append(
+                f"Active asset/class constraints prevented exact 1/n ({target_share:.2%}) risk parity; "
+                f"returning constrained approximate ERC (max risk-share deviation={max_dev:.4%}, std={std_rc:.4%})."
+            )
+
+    return _assemble_strategy_result(
+        strategy_name="erc",
+        weights=best_w,
+        resolved=resolved,
+        cov_matrix=cov_psd,
+        mu=mu,
+        rf=rf,
+        weekly_returns=weekly_returns,
+        cvar_confidence=cvar_confidence,
+        converged=converged,
+        status=status,
+        diagnostics={
+            "solver": solver_used,
+            "solver_tolerance": resolved.solver_tolerance,
+            "solver_message": solver_msg,
+            "target_risk_share": target_share,
+            "max_risk_share_deviation": max_dev,
+            "risk_share_std": std_rc,
+            "has_negative_risk_contributions": has_neg_rc,
+            "is_constrained_erc": is_constrained,
+            "is_valid_target": converged,
+        },
         warnings=warnings_list,
-        stats_sharpe=stats_sharpe,
-        stats_minvar=stats_minvar,
-        stats_cvar=stats_cvar,
-        start_date=start_date,
-        end_date=end_date,  # noqa: F821 - preserved verbatim from Cell 10 before Cell 13 override
-        sample_days=sample_days,
-        used_expected=dcf_upsides_clean,
-        hist_performance=hist_performance,
-        mcr_sharpe=mcr_sharpe,
-        mcr_minvar=mcr_minvar,
-        mcr_cvar=mcr_cvar,
-        prices_hist=prices,
-        historical_perf_chart_path=historical_perf_chart_path,
-        correlation_heatmap_path=correlation_heatmap_path,
-        mcr_chart_path=mcr_chart_path,
-        patrimonio_chart_path=patrimonio_chart_path,
-        total_return_chart_path=total_return_chart_path,
-        individual_returns_chart_path=individual_returns_chart_path,
-        is_existing_portfolio=is_existing,
-        stress_test_results=stress_results,
-        mu_sources=mu_source,
-        vix_level=vix_current,
-        cov_inflation_factor=cov_inflation
     )
 
 
-# Preserve reference to the pre-override Cell 10 definition before Cell 13 redefines it.
-_analyze_portfolio_cell10 = analyze_portfolio
+def _cluster_ivp_variance(sigma: np.ndarray, indices: List[int]) -> float:
+    """Compute cluster variance using inverse-variance weights (diagonal variances ONLY, zero Sigma inversion)."""
+    sub_cov = sigma[np.ix_(indices, indices)]
+    diag_var = np.maximum(np.diag(sub_cov), 1e-16)
+    ivp = (1.0 / diag_var) / np.sum(1.0 / diag_var)
+    return float(ivp @ sub_cov @ ivp)
 
 
-# =============================================================================
-# Cell 12: Black-Litterman, Shrinkage, Regime Covariance, Stress Tests, Pipeline μ
-# =============================================================================
+def compute_pure_hrp_weights(
+    cov_matrix: pd.DataFrame,
+    *,
+    linkage_method: str = "single",
+) -> Tuple[np.ndarray, List[str]]:
+    """Compute pure López de Prado (2016) HRP weights without inverting Sigma.
 
-def get_market_caps(tickers_list):
-    caps = {}
+    Deterministic tie-breaking policy (AUD-13):
+    - Validates unique asset labels and exact index/column alignment.
+    - Sorts asset IDs canonically in alphabetical order BEFORE constructing the
+      correlation distance matrix and SciPy hierarchical clustering linkage tree
+      (``linkage_method``), ensuring exact permutation invariance even when pairs
+      share identical correlations (ties), then remaps weights back to the caller's
+      original ticker order.
+    """
+    orig_tickers = [str(t) for t in cov_matrix.index]
+    orig_cols = [str(c) for c in cov_matrix.columns]
+    if len(set(orig_tickers)) != len(orig_tickers):
+        raise DataQualityError("HRP covariance matrix contains duplicate asset labels.")
+    if set(orig_tickers) != set(orig_cols) or len(orig_tickers) != len(orig_cols):
+        raise DataQualityError("HRP covariance matrix index and columns must contain the same unique asset IDs.")
+
+    n = len(orig_tickers)
+    if n == 1:
+        return np.array([1.0], dtype=float), orig_tickers
+
+    # Canonical alphabetical ordering guarantees deterministic tie-breaking invariant to input permutation
+    canon_tickers = sorted(orig_tickers)
+    cov_canon = cov_matrix.loc[canon_tickers, canon_tickers]
+
+    corr_df, _ = covariance_to_correlation(cov_canon)
+    corr = corr_df.to_numpy(dtype=float)
+    sigma = cov_canon.to_numpy(dtype=float)
+
+    dist = np.sqrt(np.maximum(0.5 * (1.0 - corr), 0.0))
+    dist = 0.5 * (dist + dist.T)
+    np.fill_diagonal(dist, 0.0)
+
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method=linkage_method)
+    sort_ix = [int(i) for i in leaves_list(Z)]
+    ordered_tickers = [canon_tickers[i] for i in sort_ix]
+
+    weights_canon = np.ones(n, dtype=float)
+    clusters: List[List[int]] = [sort_ix]
+
+    while clusters:
+        next_clusters: List[List[int]] = []
+        for cluster in clusters:
+            if len(cluster) <= 1:
+                continue
+            split = len(cluster) // 2
+            left = cluster[:split]
+            right = cluster[split:]
+
+            var_left = _cluster_ivp_variance(sigma, left)
+            var_right = _cluster_ivp_variance(sigma, right)
+            denom = var_left + var_right
+            alpha = 0.5 if denom <= 1e-18 else (1.0 - var_left / denom)
+
+            weights_canon[left] *= alpha
+            weights_canon[right] *= 1.0 - alpha
+
+            if len(left) > 1:
+                next_clusters.append(left)
+            if len(right) > 1:
+                next_clusters.append(right)
+        clusters = next_clusters
+
+    w_sum = float(np.sum(weights_canon))
+    if w_sum <= 0.0 or not np.all(np.isfinite(weights_canon)):
+        raise OptimizationConvergenceError("Pure HRP produced invalid weights.")
+    weights_canon /= w_sum
+
+    w_by_ticker = {t: float(w) for t, w in zip(canon_tickers, weights_canon)}
+    weights_orig = np.array([w_by_ticker[t] for t in orig_tickers], dtype=float)
+    return weights_orig, ordered_tickers
+
+
+def optimize_hrp(
+    cov_matrix: pd.DataFrame,
+    resolved: ResolvedConstraints,
+    *,
+    linkage_method: str = "single",
+    mu: Optional[pd.Series] = None,
+    rf: float = 0.0,
+    weekly_returns: Optional[pd.DataFrame] = None,
+    cvar_confidence: float = 0.95,
+) -> StrategyAllocationResult:
+    """Compute HRP weights (never inverting Sigma) and apply explicit feasible projection if needed."""
+    tickers = list(resolved.tickers)
+    cov_ordered = cov_matrix.loc[tickers, tickers]
+    cov_psd, psd_adj, min_b, min_a = ensure_psd_covariance(cov_ordered)
+
+    warnings_list: List[str] = []
+    if psd_adj:
+        warnings_list.append(
+            f"HRP input covariance required PSD adjustment (min eig {min_b:.3e} -> {min_a:.3e})."
+        )
+
+    w_pure, quasi_order = compute_pure_hrp_weights(cov_psd, linkage_method=linkage_method)
+    pure_feasible, pure_violations = verify_solution_feasibility(w_pure, resolved)
+
+    if pure_feasible:
+        w_final = w_pure
+        converged = True
+        status = "optimal"
+        is_adjusted = False
+        l1_adj = 0.0
+        max_adj = 0.0
+    else:
+        w_proj, conv_proj, ok_proj = _project_weights_onto_feasible(w_pure, resolved)
+        if not ok_proj:
+            raise OptimizationConvergenceError(
+                "Constrained HRP projection onto feasible constraint polytope failed to find a feasible point.",
+                details={"strategy": "hrp", "pure_violations": pure_violations},
+            )
+        w_final = w_proj
+        converged = conv_proj
+        is_adjusted = True
+        l1_adj = float(np.sum(np.abs(w_final - w_pure)))
+        max_adj = float(np.max(np.abs(w_final - w_pure)))
+        if conv_proj:
+            status = "adjusted_to_constraints"
+            warnings_list.append(
+                f"Pure HRP weights violated active asset/class/HHI constraints ({'; '.join(pure_violations[:3])}); "
+                f"applied minimum-L2 feasible projection (L1 adjustment={l1_adj:.4f}, max weight shift={max_adj:.4f}). "
+                "Result is constraint-adjusted HRP, not unmodified standard HRP."
+            )
+        else:
+            status = "non_converged"
+            warnings_list.append(
+                "Constrained HRP projection solver did not converge (res.success=False); "
+                "feasible projected candidate retained for diagnostics only and is NOT optimal."
+            )
+
+    return _assemble_strategy_result(
+        strategy_name="hrp",
+        weights=w_final,
+        resolved=resolved,
+        cov_matrix=cov_psd,
+        mu=mu,
+        rf=rf,
+        weekly_returns=weekly_returns,
+        cvar_confidence=cvar_confidence,
+        converged=converged,
+        status=status,
+        diagnostics={
+            "linkage_method": linkage_method,
+            "tie_break_policy": "canonical_alphabetical_instrument_id_ordering",
+            "quasi_diagonal_order": quasi_order,
+            "uses_sigma_inversion": False,
+            "is_constrained_adjusted": is_adjusted,
+            "pure_hrp_weights": {t: float(v) for t, v in zip(tickers, w_pure)},
+            "l1_adjustment": l1_adj,
+            "max_weight_adjustment": max_adj,
+            "pure_hrp_violations": pure_violations,
+            "solver_tolerance": resolved.solver_tolerance,
+            "is_valid_target": converged,
+        },
+        warnings=warnings_list,
+    )
+
+
+def stress_test_corr_one(weights: np.ndarray, cov_matrix: pd.DataFrame, tickers_list: List[str]) -> Dict[str, Any]:
+    w = np.asarray(weights, dtype=float)
+    cov_vals = cov_matrix.loc[tickers_list, tickers_list].to_numpy(dtype=float) if hasattr(cov_matrix, "loc") else np.asarray(cov_matrix, dtype=float)
+    vols = np.sqrt(np.maximum(np.diag(cov_vals), 0.0))
+    stress_vol = float(np.sum(w * vols))
+    normal_vol = float(np.sqrt(max(float(w @ cov_vals @ w), 0.0)))
+    div_ratio = normal_vol / stress_vol if stress_vol > 1e-12 else 1.0
+    stress_contrib = (w * vols / stress_vol) if stress_vol > 1e-12 else w
+    recommendations: List[str] = []
+    if div_ratio > 0.90:
+        recommendations.append("CRITICAL: Almost no diversification benefit under correlation=1 stress.")
+    elif div_ratio > 0.85:
+        recommendations.append("WARNING: Limited diversification under correlation=1 stress.")
+    for i, t in enumerate(tickers_list):
+        if stress_contrib[i] > 0.30:
+            recommendations.append(f"High stress concentration in {t} ({stress_contrib[i] * 100:.1f}% of corr=1 stress risk).")
+    return {
+        "normal_vol": normal_vol,
+        "stress_vol": stress_vol,
+        "diversification_ratio": div_ratio,
+        "vol_increase_pct": ((stress_vol / normal_vol) - 1.0) * 100.0 if normal_vol > 1e-12 else 0.0,
+        "false_diversification": bool(div_ratio > 0.85),
+        "stress_contributions": pd.Series(stress_contrib, index=tickers_list, dtype=float),
+        "recommendations": recommendations,
+    }
+
+
+def stress_test_vol_shock(
+    weights: np.ndarray, cov_matrix: pd.DataFrame, tickers_list: List[str], shock_factor: float = 2.0
+) -> Dict[str, Any]:
+    w = np.asarray(weights, dtype=float)
+    cov_vals = cov_matrix.loc[tickers_list, tickers_list].to_numpy(dtype=float) if hasattr(cov_matrix, "loc") else np.asarray(cov_matrix, dtype=float)
+    normal_vol = float(np.sqrt(max(float(w @ cov_vals @ w), 0.0)))
+    stress_vol = normal_vol * float(shock_factor)
+    recommendations: List[str] = []
+    if stress_vol > 0.60:
+        recommendations.append(f"CRITICAL: Volatility under {shock_factor:g}x shock reaches {stress_vol * 100:.1f}% (>60%).")
+    return {
+        "normal_vol": normal_vol,
+        "stress_vol": stress_vol,
+        "shock_factor": float(shock_factor),
+        "vol_increase_pct": ((stress_vol / normal_vol) - 1.0) * 100.0 if normal_vol > 1e-12 else 0.0,
+        "recommendations": recommendations,
+    }
+
+
+def stress_test_systemic(
+    weights: np.ndarray,
+    cov_matrix: pd.DataFrame,
+    tickers_list: List[str],
+    corr_floor: float = 0.80,
+    vol_shock: float = 1.5,
+) -> Dict[str, Any]:
+    w = np.asarray(weights, dtype=float)
+    cov_vals = cov_matrix.loc[tickers_list, tickers_list].to_numpy(dtype=float) if hasattr(cov_matrix, "loc") else np.asarray(cov_matrix, dtype=float)
+    vols = np.sqrt(np.maximum(np.diag(cov_vals), 0.0))
+    normal_vol = float(np.sqrt(max(float(w @ cov_vals @ w), 0.0)))
+    shocked_vols = vols * float(vol_shock)
+    n = len(vols)
+    stress_corr = np.full((n, n), float(corr_floor), dtype=float)
+    np.fill_diagonal(stress_corr, 1.0)
+    stress_cov = np.outer(shocked_vols, shocked_vols) * stress_corr
+    stress_vol = float(np.sqrt(max(float(w @ stress_cov @ w), 0.0)))
+    max_weekly_loss_99 = stress_vol / math.sqrt(WEEKS_PER_YEAR) * 2.3263
+    recommendations: List[str] = []
+    if normal_vol > 1e-12 and stress_vol > normal_vol * 2.5:
+        recommendations.append("CRITICAL: Portfolio risk expands >2.5x under systemic stress.")
+    elif normal_vol > 1e-12 and stress_vol > normal_vol * 2.0:
+        recommendations.append("WARNING: Elevated risk under systemic stress (>2.0x).")
+    return {
+        "normal_vol": normal_vol,
+        "stress_vol": stress_vol,
+        "vol_increase_pct": ((stress_vol / normal_vol) - 1.0) * 100.0 if normal_vol > 1e-12 else 0.0,
+        "corr_floor": float(corr_floor),
+        "vol_shock_factor": float(vol_shock),
+        "max_weekly_loss_99": max_weekly_loss_99,
+        "recommendations": recommendations,
+    }
+
+
+def run_all_stress_tests(weights: np.ndarray, cov_matrix: pd.DataFrame, tickers_list: List[str]) -> Dict[str, Any]:
+    return {
+        "corr_one": stress_test_corr_one(weights, cov_matrix, tickers_list),
+        "vol_shock": stress_test_vol_shock(weights, cov_matrix, tickers_list, shock_factor=2.0),
+        "systemic": stress_test_systemic(weights, cov_matrix, tickers_list, corr_floor=0.80, vol_shock=1.5),
+    }
+
+
+def get_market_caps(tickers_list: Sequence[str]) -> Dict[str, float]:
+    caps: Dict[str, float] = {}
     for t in tickers_list:
         try:
-            info = yf.Ticker(t).info
-            cap = info.get('marketCap', None)
-            if cap and cap > 0:
-                caps[t] = float(cap)
+            info = yf.Ticker(t).info or {}
+            cap = info.get("marketCap")
+            if cap is not None and float(cap) > 0.0:
+                caps[t.upper()] = float(cap)
         except Exception:
-            pass
+            continue
     return caps
 
 
-def compute_market_weights(tickers_list, market_caps=None):
-    if market_caps is None:
-        market_caps = get_market_caps(tickers_list)
-    available = {t: market_caps[t] for t in tickers_list if t in market_caps and market_caps[t] > 0}
-    if len(available) < max(2, int(len(tickers_list) * 0.5)):
-        n = len(tickers_list)
-        return pd.Series([1.0 / n] * n, index=tickers_list)
-    median_cap = float(np.median(list(available.values())))
-    all_caps = {t: available.get(t, median_cap) for t in tickers_list}
-    total = sum(all_caps.values())
-    return pd.Series({t: c / total for t, c in all_caps.items()})
-
-
-def compute_equilibrium_returns(cov_matrix, market_weights, risk_aversion=2.5):
-    w = market_weights.reindex(cov_matrix.index).fillna(1.0 / len(cov_matrix))
-    pi = risk_aversion * cov_matrix.values @ w.values
-    return pd.Series(pi, index=cov_matrix.index)
-
-
-def black_litterman_returns(cov_matrix, market_weights, risk_aversion=2.5, tau=0.05,
-                            P=None, Q=None, omega=None):
-    pi = compute_equilibrium_returns(cov_matrix, market_weights, risk_aversion)
-    if P is None or Q is None or len(Q) == 0:
-        return pi
-    tau_sigma = tau * cov_matrix.values
-    if omega is None:
-        omega = np.diag(np.diag(P @ tau_sigma @ P.T)) * 10
-    try:
-        inv_tau_sigma = np.linalg.inv(tau_sigma)
-        inv_omega = np.linalg.inv(omega)
-        M = np.linalg.inv(inv_tau_sigma + P.T @ inv_omega @ P)
-        mu_bl = M @ (inv_tau_sigma @ pi.values + P.T @ inv_omega @ Q)
-        return pd.Series(mu_bl, index=cov_matrix.index)
-    except np.linalg.LinAlgError:
-        return pi
-
-
-def build_ml_views_for_bl(tickers_list, ml_predictions_5y, cov_matrix):
-    if not ml_predictions_5y:
-        return None, None, None
-    available = [t for t in tickers_list if t in ml_predictions_5y]
-    if len(available) < 2:
-        return None, None, None
-
-    def _get_return(t):
-        try:
-            return float(ml_predictions_5y[t]['scenarios']['base']['predicted_return'])
-        except (KeyError, TypeError):
-            return 0.0
-
-    sorted_by_return = sorted(available, key=_get_return, reverse=True)
-    views_P = []
-    views_Q = []
-    n_views = min(len(sorted_by_return) // 2, 3)
-    for i in range(n_views):
-        long_t = sorted_by_return[i]
-        short_t = sorted_by_return[-(i + 1)]
-        if long_t == short_t:
-            continue
-        spread = (_get_return(long_t) - _get_return(short_t)) / 5.0 * 0.5
-        if abs(spread) < 0.001:
-            continue
-        p_row = np.zeros(len(tickers_list))
-        p_row[tickers_list.index(long_t)] = 1.0
-        p_row[tickers_list.index(short_t)] = -1.0
-        views_P.append(p_row)
-        views_Q.append(spread)
-    if not views_P:
-        return None, None, None
-    P = np.array(views_P)
-    Q = np.array(views_Q)
-    tau_sigma = 0.05 * cov_matrix.values
-    omega = np.diag(np.diag(P @ tau_sigma @ P.T)) * 20
-    return P, Q, omega
-
-
-def shrinkage_covariance(daily_returns, method='ledoit_wolf'):
-    if method == 'oas':
-        estimator = OAS_estimator().fit(daily_returns.values)
-    else:
-        estimator = LedoitWolf().fit(daily_returns.values)
-    cov_shrunk = pd.DataFrame(
-        estimator.covariance_, index=daily_returns.columns, columns=daily_returns.columns
-    ) * 252
-    return cov_shrunk, getattr(estimator, 'shrinkage_', None)
-
-
-def regime_adjusted_covariance(daily_returns, stress_weight=0.30, lookback_stress=63,
-                                shrinkage_method='ledoit_wolf'):
-    cov_calm, shrink_calm = shrinkage_covariance(daily_returns, method=shrinkage_method)
-    print(f"  Shrinkage ({shrinkage_method}): coef={shrink_calm:.4f}" if shrink_calm is not None else f"  Shrinkage ({shrinkage_method})")
-
-    rolling_vol = daily_returns.rolling(21).std().mean(axis=1).dropna()
-    cov_crisis = cov_calm.copy()
-
-    if len(rolling_vol) > lookback_stress:
-        vol_threshold = rolling_vol.quantile(0.75)
-        stress_mask = rolling_vol > vol_threshold
-        stress_returns = daily_returns.loc[stress_mask.index[stress_mask]]
-        if len(stress_returns) >= 30:
-            try:
-                cov_crisis, shrink_crisis = shrinkage_covariance(stress_returns, method=shrinkage_method)
-                print(f"  Régimen crisis: {len(stress_returns)} obs, shrinkage={shrink_crisis:.4f}" if shrink_crisis is not None else f"  Régimen crisis: {len(stress_returns)} obs")
-            except Exception:
-                cov_crisis = cov_calm * 1.5
-                print("  Régimen crisis: fallback 1.5x")
-        else:
-            cov_crisis = cov_calm * 1.5
-            print("  Régimen crisis: fallback 1.5x (obs insuficientes)")
-    else:
-        cov_crisis = cov_calm * 1.5
-        print("  Régimen crisis: fallback 1.5x (serie corta)")
-
-    p_calm = 1.0 - stress_weight
-    p_crisis = stress_weight
-    cov_blended = p_calm * cov_calm + p_crisis * cov_crisis
-    print(f"  Σ_final = {p_calm:.0%}·Σ_calma + {p_crisis:.0%}·Σ_crisis")
-
-    return cov_blended, cov_calm, cov_crisis
-
-
-def get_current_vix():
-    try:
-        vix = yf.Ticker("^VIX")
-        hist = vix.history(period="5d")
-        if not hist.empty:
-            return float(hist['Close'].dropna().iloc[-1])
-    except Exception:
-        pass
-    return None
-
-
-def forward_looking_cov_adjustment(cov_matrix, vix_current=None):
-    factor = 1.0
-    if vix_current is not None and np.isfinite(vix_current):
-        if vix_current > 35:
-            factor = 1.40
-        elif vix_current > 30:
-            factor = 1.25
-        elif vix_current > 25:
-            factor = 1.15
-        elif vix_current > 20:
-            factor = 1.05
-    return cov_matrix * factor, factor
-
-
-def stress_test_corr_one(weights, cov_matrix, tickers_list):
-    w = np.array(weights)
-    cov_vals = cov_matrix.values if hasattr(cov_matrix, 'values') else np.array(cov_matrix)
-    vols = np.sqrt(np.diag(cov_vals))
-    stress_vol = float(np.sum(w * vols))
-    normal_vol = float(np.sqrt(w @ cov_vals @ w))
-    div_ratio = normal_vol / stress_vol if stress_vol > 0 else 1.0
-    stress_contrib = (w * vols / stress_vol) if stress_vol > 0 else w
-    recommendations = []
-    if div_ratio > 0.90:
-        recommendations.append("CRÍTICO: Diversificación casi nula bajo estrés.")
-    elif div_ratio > 0.85:
-        recommendations.append("ADVERTENCIA: Diversificación limitada bajo estrés.")
-    for i, t in enumerate(tickers_list):
-        if stress_contrib[i] > 0.30:
-            recommendations.append(f"Reducir {t} ({stress_contrib[i]*100:.1f}% del riesgo estrés)")
-    return {
-        'normal_vol': normal_vol,
-        'stress_vol': stress_vol,
-        'diversification_ratio': div_ratio,
-        'vol_increase_pct': ((stress_vol / normal_vol) - 1) * 100 if normal_vol > 0 else 0,
-        'false_diversification': div_ratio > 0.85,
-        'stress_contributions': pd.Series(stress_contrib, index=tickers_list),
-        'recommendations': recommendations
-    }
-
-
-def stress_test_vol_shock(weights, cov_matrix, tickers_list, shock_factor=2.0):
-    w = np.array(weights)
-    cov_vals = cov_matrix.values if hasattr(cov_matrix, 'values') else np.array(cov_matrix)
-    normal_vol = float(np.sqrt(w @ cov_vals @ w))
-    shocked_cov = cov_vals * (shock_factor ** 2)
-    stress_vol = float(np.sqrt(w @ shocked_cov @ w))
-    recommendations = []
-    if stress_vol > 0.60:
-        recommendations.append(f"CRÍTICO: Vol estrés {stress_vol*100:.1f}% supera umbral 60%.")
-    return {
-        'normal_vol': normal_vol,
-        'stress_vol': stress_vol,
-        'shock_factor': shock_factor,
-        'vol_increase_pct': ((stress_vol / normal_vol) - 1) * 100 if normal_vol > 0 else 0,
-        'recommendations': recommendations
-    }
-
-
-def stress_test_systemic(weights, cov_matrix, tickers_list, corr_floor=0.80, vol_shock=1.5):
-    w = np.array(weights)
-    cov_vals = cov_matrix.values if hasattr(cov_matrix, 'values') else np.array(cov_matrix)
-    vols = np.sqrt(np.diag(cov_vals))
-    normal_vol = float(np.sqrt(w @ cov_vals @ w))
-    shocked_vols = vols * vol_shock
-    n = len(vols)
-    stress_corr = np.full((n, n), corr_floor)
-    np.fill_diagonal(stress_corr, 1.0)
-    stress_cov = np.outer(shocked_vols, shocked_vols) * stress_corr
-    stress_vol = float(np.sqrt(w @ stress_cov @ w))
-    max_loss_1d = stress_vol / np.sqrt(252) * 2.33
-    recommendations = []
-    if stress_vol > normal_vol * 2.5:
-        recommendations.append("CRÍTICO: Portfolio colapsa bajo crisis sistémica.")
-    elif stress_vol > normal_vol * 2.0:
-        recommendations.append("ADVERTENCIA: Riesgo elevado bajo crisis sistémica.")
-    return {
-        'normal_vol': normal_vol,
-        'stress_vol': stress_vol,
-        'vol_increase_pct': ((stress_vol / normal_vol) - 1) * 100 if normal_vol > 0 else 0,
-        'corr_floor': corr_floor,
-        'vol_shock_factor': vol_shock,
-        'max_daily_loss_99': max_loss_1d,
-        'recommendations': recommendations
-    }
-
-
-def run_all_stress_tests(weights, cov_matrix, tickers_list):
-    return {
-        'corr_one': stress_test_corr_one(weights, cov_matrix, tickers_list),
-        'vol_shock': stress_test_vol_shock(weights, cov_matrix, tickers_list, shock_factor=2.0),
-        'systemic': stress_test_systemic(weights, cov_matrix, tickers_list, corr_floor=0.80, vol_shock=1.5)
-    }
-
-
-def compute_expected_returns_pipeline(tickers_list, daily_returns, cov_matrix,
-                                      dcf_upsides, ml_predictions_5y=None,
-                                      country_risk_map=None, country_risk_value=0.0):
-    n = len(tickers_list)
-    mu_final = pd.Series(np.zeros(n), index=tickers_list)
-    mu_source = {}
-    dcf_upsides = dcf_upsides or {}
-    has_any_dcf = len(dcf_upsides) > 0
-
-    if has_any_dcf:
-        print("  🔒 Pipeline A: μ_DCF detectado → BL completamente excluido")
-        hist_annual = daily_returns.mean() * 252
-        for t in tickers_list:
-            if t in dcf_upsides and dcf_upsides[t] != 0:
-                mu_final[t] = dcf_upsides[t]
-                mu_source[t] = "DCF/Usuario (sagrado, sin modificar)"
-            else:
-                mu_final[t] = hist_annual[t]
-                mu_source[t] = "Media histórica anualizada (Pipeline A, sin BL)"
-    else:
-        print("  Sin μ_DCF → Ejecutando Black-Litterman con prior de mercado...")
-        market_caps = get_market_caps(tickers_list)
-        w_mkt = compute_market_weights(tickers_list, market_caps)
-        P, Q, omega = None, None, None
-        if ml_predictions_5y:
-            P, Q, omega = build_ml_views_for_bl(tickers_list, ml_predictions_5y, cov_matrix)
-            if P is not None:
-                print(f"  🤖 {len(Q)} views ML relativas (Ω inflada 20x)")
-        mu_bl = black_litterman_returns(cov_matrix, w_mkt, risk_aversion=2.5, tau=0.05,
-                                        P=P, Q=Q, omega=omega)
-        for t in tickers_list:
-            mu_final[t] = mu_bl[t]
-            if P is not None:
-                mu_source[t] = "Black-Litterman (mercado + ML views baja confianza)"
-            else:
-                mu_source[t] = "Black-Litterman (equilibrio de mercado)"
-
-    country_risk_map = country_risk_map or {}
-    non_dcf_tickers = [t for t in tickers_list if t not in dcf_upsides]
-
-    global_country_risk_premia = state.country_risk_premia or {}
-
-    for t in non_dcf_tickers:
-        pais = country_risk_map.get(t, "")
-        if pais == "Argentina" and country_risk_value > 0:
-            mu_final[t] -= country_risk_value
-            mu_source[t] += f" - Riesgo País AR (-{country_risk_value*100:.2f}%)"
-        elif pais in global_country_risk_premia:
-            risk_score = global_country_risk_premia[pais]
-            excess_vol_ratio = max(0, risk_score - 1.0)
-            adjustment = min(excess_vol_ratio * 0.03, 0.15)
-            if adjustment > 0.001:
-                mu_final[t] -= adjustment
-                mu_source[t] += f" - Riesgo País {pais} (-{adjustment*100:.2f}%)"
-
-    return mu_final, mu_source
-
-
-def get_sector_map(tickers_list):
-    sectors = {}
+def get_sector_map(tickers_list: Sequence[str]) -> Dict[str, str]:
+    sectors: Dict[str, str] = {}
     for t in tickers_list:
         try:
-            info = yf.Ticker(t).info
-            sectors[t] = info.get('sector', 'Unknown')
+            info = yf.Ticker(t).info or {}
+            sectors[t.upper()] = str(info.get("sector") or "Unknown")
         except Exception:
-            sectors[t] = 'Unknown'
+            sectors[t.upper()] = "Unknown"
     return sectors
 
 
-def compute_stress_weight_caps(cov_matrix, tickers_list, floor=0.05, ceiling=0.20):
-    cov_vals = cov_matrix.values if hasattr(cov_matrix, 'values') else np.array(cov_matrix)
-    vols = np.sqrt(np.diag(cov_vals))
-    median_vol = np.median(vols)
-    caps = []
-    for i, t in enumerate(tickers_list):
-        vol_ratio = vols[i] / median_vol if median_vol > 0 else 1.0
-        if vol_ratio > 2.5:
-            cap = 0.10
-        elif vol_ratio > 2.0:
-            cap = 0.15
-        elif vol_ratio > 1.5:
-            cap = 0.20
+@dataclass(frozen=True)
+class _TradablePriceResolution:
+    """Single source of truth for an instrument's tradable market price resolution (NEW-01)."""
+
+    instrument_id: str
+    tradable: bool
+    quoted_price_usd: Optional[float]
+    quoted_price_for_terms: Optional[float]
+    quoted_currency_for_terms: Optional[str]
+    source: Optional[str]
+    series_type: str
+    quote_unit: Optional[str]
+    price_timestamp: Optional[str]
+    blocked_reason: Optional[str] = None
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+
+def _resolve_tradable_market_price(
+    inst: InstrumentConfig,
+    *,
+    iol_quotes: Dict[str, IOLQuoteResult],
+    prices_cols: Dict[str, pd.Series],
+    direct_price_sources: Dict[str, str],
+    unadjusted_closes: Dict[str, pd.Series],
+    proxies_used: Dict[str, str],
+    duplicate_date_policy: str,
+    weekly_cutoff_tz: str,
+    as_of_cutoff: Optional[pd.Timestamp],
+    as_of_date: Optional[Any] = None,
+) -> _TradablePriceResolution:
+    """Resolve a single authoritative tradable market price shared by YTM, valuation, and rebalancing.
+
+    Precedence (preserving AUD-02, AUD-06, AUD-09):
+    1. Valid IOL quote (``iol_quotes[iid]``)
+    2. Explicit ``inst.manual_price_usd``
+    3. Direct historical price series (``direct_price_sources[iid]``):
+       - For individual debt (``INDIVIDUAL_DEBT_SUBTYPES`` or instruments carrying
+         ``fixed_income_terms``):
+         * Series marked ``historical_price_series_type == "adjusted_total_return"`` is
+           NEVER treated as a tradable clean/dirty market price (blocked for both YTM and
+           rebalancing; risk model may still use it as a total-return risk series).
+         * When ``quote_source == "yfinance"`` and ``historical_price_series_type == "market_price"``,
+           strictly requires ``unadjusted_closes[ticker]`` (``auto_adjust=False``) and NEVER
+           falls back to ``auto_adjust=True``.
+         * Risk proxies (``proxies_used``) are NEVER treated as tradable bond market prices.
+       - For all other instruments (equities, ETFs, gold, crypto): uses sanitized historical
+         USD series up to ``as_of_cutoff``.
+    """
+    iid = inst.instrument_id
+    terms = inst.fixed_income_terms
+    is_individual_debt = (inst.asset_subtype in INDIVIDUAL_DEBT_SUBTYPES) or (terms is not None)
+
+    # 1. Valid IOL snapshot quote
+    if iid in iol_quotes:
+        iq = iol_quotes[iid]
+        q_usd = float(iq.price_usd)
+        if terms is not None and terms.cashflow_currency != "USD":
+            q_terms = iq.price_original
+            ccy_terms = iq.original_currency
         else:
-            cap = ceiling
-        caps.append((floor, max(floor, cap)))
-    return caps
+            q_terms = q_usd
+            ccy_terms = "USD"
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=q_usd,
+            quoted_price_for_terms=q_terms,
+            quoted_currency_for_terms=ccy_terms,
+            source=iq.panel_source,
+            series_type="iol_snapshot",
+            quote_unit=iq.quote_unit,
+            price_timestamp=iq.market_timestamp or iq.observed_at,
+        )
 
+    # 2. Explicit manual_price_usd
+    if inst.manual_price_usd is not None:
+        m_usd = float(inst.manual_price_usd)
+        terms_is_usd = terms is None or terms.cashflow_currency == "USD"
+        ts_str = (
+            terms.settlement_date.isoformat()
+            if terms is not None
+            else (as_of_date.isoformat() if as_of_date is not None else None)
+        )
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=m_usd,
+            quoted_price_for_terms=m_usd if terms_is_usd else None,
+            quoted_currency_for_terms="USD" if terms_is_usd else None,
+            source="manual_price_usd",
+            series_type="manual_price_usd",
+            quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+            price_timestamp=ts_str,
+        )
 
-def optimize_with_sector_and_stress(mu, cov_matrix, rf, tickers_list,
-                                     hhi_limit=0.35, max_sector_weight=0.40,
-                                     sector_map=None, stress_bounds=None):
-    n = len(mu)
-    if sector_map is None:
-        sector_map = {}
+    # 3. Direct historical series for individual debt (strict tradable market-price guards)
+    if is_individual_debt:
+        if iid not in direct_price_sources:
+            if iid in proxies_used:
+                proxy_sym = proxies_used[iid]
+                return _TradablePriceResolution(
+                    instrument_id=iid,
+                    tradable=False,
+                    quoted_price_usd=None,
+                    quoted_price_for_terms=None,
+                    quoted_currency_for_terms=None,
+                    source=f"proxy:{proxy_sym}",
+                    series_type="proxy_only",
+                    quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                    price_timestamp=None,
+                    blocked_reason=(
+                        f"Individual debt instrument '{iid}' lacks a tradable market price "
+                        f"(no IOL quote, no manual_price_usd, and no direct market price series; "
+                        f"risk proxy '{proxy_sym}' is not a tradable bond price)."
+                    ),
+                )
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=None,
+                series_type="missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"Individual debt instrument '{iid}' lacks a tradable market price "
+                    "(no IOL quote, no manual_price_usd, and no direct historical market price)."
+                ),
+            )
 
-    bounds = stress_bounds if stress_bounds else compute_stress_weight_caps(cov_matrix, tickers_list)
+        hist_src = direct_price_sources[iid]
+        if inst.historical_price_series_type == "adjusted_total_return":
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="adjusted_total_return",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"Historical series from '{hist_src}' for '{iid}' is marked 'adjusted_total_return' "
+                    "and is not a tradable clean/dirty market price suitable for contractual YTM, valuation, or rebalancing. "
+                    "Supply an IOL quote or explicit manual_price_usd."
+                ),
+            )
 
-    def neg_sharpe(w):
-        ret = w @ mu.values
-        vol = np.sqrt(w @ cov_matrix.values @ w)
-        return -(ret - rf) / vol if vol > 1e-10 else 1e10
-
-    constraints = [
-        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
-        {'type': 'ineq', 'fun': lambda w: hhi_limit - np.sum(w ** 2)}
-    ]
-
-    sector_groups = {}
-    for i, t in enumerate(tickers_list):
-        s = sector_map.get(t, 'Unknown')
-        if s not in sector_groups:
-            sector_groups[s] = []
-        sector_groups[s].append(i)
-
-    for sector, indices in sector_groups.items():
-        if len(indices) >= 2 and sector != 'Unknown':
-            constraints.append({
-                'type': 'ineq',
-                'fun': lambda w, idx=indices: max_sector_weight - sum(w[j] for j in idx)
-            })
-
-    w0 = np.array([1.0 / n] * n)
-    result = minimize(neg_sharpe, w0, method='SLSQP', bounds=bounds,
-                      constraints=constraints, options={'maxiter': 2000, 'ftol': 1e-12})
-    if result.success:
-        hhi_val = np.sum(result.x ** 2)
-        print(f"✅ Optimización exitosa — HHI={hhi_val:.4f} (límite: {hhi_limit})")
-        return result.x
-    print("⚠️ Optimización no convergió. Usando pesos iguales.")
-    return w0
-
-
-# =============================================================================
-# Cell 13: Effective redefinition of analyze_portfolio (overrides Cell 10)
-# =============================================================================
-
-def analyze_portfolio(assets: Iterable[dict], rf_rate: Optional[float] = None,  # noqa: F811
-                      samples: int = 2000, dcf_upsides: Optional[dict] = None,
-                      ml_predictions_5y: Optional[dict] = None,
-                      investment_horizon: int = 3, sales: Optional[List[dict]] = None,
-                      country_risk_argentina: Optional[float] = None,
-                      shrinkage_method: str = 'ledoit_wolf') -> AnalysisResult:
-    if rf_rate is None:
-        rf_rate = obtener_tasa_libre_riesgo()
-
-    tickers = sorted({a.get("ticker", "").upper() for a in assets if a.get("ticker")})
-    if not tickers:
-        raise ValueError("No hay tickers para analizar.")
-
-    sales = sales or []
-    assets_list = list(assets)
-    is_existing = _is_existing_portfolio(assets_list)
-
-    if is_existing:
-        buy_dates = []
-        for asset in assets_list:
-            if asset.get("mode") == "existing" and asset.get("buy_date"):
-                buy_dates.append(pd.Timestamp(asset.get("buy_date")))
-        if buy_dates:
-            earliest_date = min(buy_dates)
-            start_download = earliest_date - pd.Timedelta(days=30)
-            prices, dropped = _download_prices(tickers, period="max")
-            if not prices.empty:
-                start_download_tz = pd.Timestamp(start_download)
-                if prices.index.tz is not None:
-                    start_download_tz = start_download_tz.tz_localize('UTC')
-                prices = prices[prices.index >= start_download_tz]
+        dl_key = inst.ticker.upper()
+        if hist_src == "yfinance":
+            candidate_series = unadjusted_closes.get(dl_key)
+            if candidate_series is None or candidate_series.empty:
+                return _TradablePriceResolution(
+                    instrument_id=iid,
+                    tradable=False,
+                    quoted_price_usd=None,
+                    quoted_price_for_terms=None,
+                    quoted_currency_for_terms=None,
+                    source="yfinance",
+                    series_type="missing_unadjusted_close",
+                    quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                    price_timestamp=None,
+                    blocked_reason=(
+                        f"Unadjusted yfinance Close series (auto_adjust=False) is unavailable for individual debt '{iid}'; "
+                        "refusing to fall back to auto_adjust=True total-return series as a tradable market price."
+                    ),
+                )
+            series_type_lbl = "yfinance_unadjusted_close"
         else:
-            prices, dropped = _download_prices(tickers, period="10y")
-    else:
-        prices, dropped = _download_prices(tickers, period="10y")
+            candidate_series = prices_cols.get(iid)
+            series_type_lbl = "prices_usd_override_market_price"
 
-    if prices.empty:
-        raise ValueError("No se pudieron descargar precios para los tickers indicados.")
+        if candidate_series is None or candidate_series.empty:
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=f"No valid positive historical market price series available for '{iid}' from '{hist_src}'.",
+            )
 
-    available_tickers = [t for t in prices.columns]
-    start_date = prices.index.min() if not prices.empty else None
-    end_date = prices.index.max() if not prices.empty else None
+        san_debt = sanitize_price_series(
+            candidate_series,
+            asset_id=iid,
+            duplicate_date_policy=duplicate_date_policy,
+            target_tz=weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            require_positive=True,
+        )
+        if san_debt.series.empty:
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=False,
+                quoted_price_usd=None,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=hist_src,
+                series_type="missing_unadjusted_close" if hist_src == "yfinance" else "missing",
+                quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                price_timestamp=None,
+                blocked_reason=(
+                    f"No valid positive tradable market price observation available for '{iid}' "
+                    f"from '{hist_src}' on or before cutoff."
+                ),
+            )
 
-    prices_daily = prices.resample('D').last().ffill()
-    daily = prices_daily.pct_change(fill_method=None).dropna(how='all')
-    daily = daily.dropna(axis=1, how='all')
-    daily = daily.fillna(0)
-    available_tickers = list(daily.columns)
+        px_val = float(san_debt.series.iloc[-1])
+        px_ts = pd.Timestamp(san_debt.series.index[-1]).date().isoformat()
+        terms_is_usd = terms is None or terms.cashflow_currency == "USD"
+        return _TradablePriceResolution(
+            instrument_id=iid,
+            tradable=True,
+            quoted_price_usd=px_val,
+            quoted_price_for_terms=px_val if terms_is_usd else None,
+            quoted_currency_for_terms="USD" if terms_is_usd else None,
+            source=hist_src,
+            series_type=series_type_lbl,
+            quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+            price_timestamp=px_ts,
+        )
 
-    if daily.empty or len(available_tickers) < 2:
-        raise ValueError("No hay retornos suficientes para el análisis.")
+    # 4. Non-individual-debt instruments (equities, ETFs, gold, crypto, etc.)
+    raw_series = prices_cols.get(iid)
+    if raw_series is not None and not raw_series.empty:
+        san_latest = sanitize_price_series(
+            raw_series,
+            asset_id=iid,
+            duplicate_date_policy=duplicate_date_policy,
+            target_tz=weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            require_positive=True,
+        )
+        if not san_latest.series.empty:
+            px_val = float(san_latest.series.iloc[-1])
+            px_ts = pd.Timestamp(san_latest.series.index[-1]).date().isoformat()
+            src_lbl = direct_price_sources.get(iid) or (
+                f"proxy:{proxies_used[iid]}" if iid in proxies_used else inst.quote_source
+            )
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=True,
+                quoted_price_usd=px_val,
+                quoted_price_for_terms=None,
+                quoted_currency_for_terms=None,
+                source=src_lbl,
+                series_type=inst.historical_price_series_type,
+                quote_unit="per_unit",
+                price_timestamp=px_ts,
+            )
 
-    print(f"\n📐 Σ: {shrinkage_method.upper()} shrinkage + régimen 70/30 + forward-looking VIX")
-    cov, cov_calm, cov_crisis = regime_adjusted_covariance(
-        daily, stress_weight=0.30, lookback_stress=63, shrinkage_method=shrinkage_method
+    return _TradablePriceResolution(
+        instrument_id=iid,
+        tradable=False,
+        quoted_price_usd=None,
+        quoted_price_for_terms=None,
+        quoted_currency_for_terms=None,
+        source=direct_price_sources.get(iid),
+        series_type="missing",
+        quote_unit="per_unit",
+        price_timestamp=None,
+        blocked_reason=f"No valid positive USD price available for '{iid}' on or before cutoff.",
     )
 
-    vix_current = get_current_vix()
-    cov, cov_inflation = forward_looking_cov_adjustment(cov, vix_current)
-    if cov_inflation > 1.0:
-        print(f"  VIX={vix_current:.1f} → Inflación Σ: {cov_inflation:.2f}x")
+
+def analyze_portfolio(
+    config: Union[PortfolioAnalysisConfig, Dict[str, Any]],
+    *,
+    prices_usd_override: Optional[pd.DataFrame] = None,
+    vix_history_override: Optional[pd.Series] = None,
+    current_vix_override: Optional[Tuple[Optional[float], Optional[pd.Timestamp], bool]] = None,
+    iol_snapshots_override: Optional[Dict[str, IOLPanelSnapshot]] = None,
+    market_caps_override: Optional[Dict[str, float]] = None,
+    sector_map_override: Optional[Dict[str, str]] = None,
+) -> AnalysisResult:
+    """Execute the complete stateless multi-asset portfolio optimization pipeline."""
+    if isinstance(config, dict):
+        forbidden = REMOVED_LEGACY_KEYS.intersection(config.keys())
+        if forbidden:
+            raise ConfigurationError(
+                f"Removed legacy parameter(s) are not supported: {sorted(forbidden)}."
+            )
+        cfg = PortfolioAnalysisConfig.from_dict(config)
+    elif isinstance(config, PortfolioAnalysisConfig):
+        cfg = config
     else:
-        print(f"  VIX={'N/A' if vix_current is None else f'{vix_current:.1f}'} → Sin inflación")
+        raise ConfigurationError(
+            f"'config' must be PortfolioAnalysisConfig or dict (got {type(config).__name__})."
+        )
 
-    if country_risk_argentina is None:
-        country_risk_argentina = state.prima_riesgo_mas_reciente
-        if country_risk_argentina is not None and country_risk_argentina > 1.0:
-            country_risk_argentina = country_risk_argentina / 100.0
-        elif country_risk_argentina is None:
-            country_risk_argentina = 0.0
+    instruments = list(cfg.instruments)
+    inst_map = cfg.instrument_map
+    ordered_ids = [inst.instrument_id for inst in instruments]
+    warnings_list: List[str] = []
 
-    asset_country_risk_map = {}
-    for asset in assets_list:
-        ticker_a = asset.get("ticker", "").upper()
-        pais_riesgo = asset.get("pais_riesgo", asset.get("pais", ""))
-        if ticker_a and pais_riesgo:
-            asset_country_risk_map[ticker_a] = pais_riesgo
+    as_of_cutoff: Optional[pd.Timestamp] = None
+    if cfg.as_of_date is not None:
+        as_of_cutoff = (pd.Timestamp(cfg.as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
 
-    dcf_upsides_clean = {}
-    if dcf_upsides:
-        dcf_upsides_clean = {k.upper(): v for k, v in dcf_upsides.items()
-                             if isinstance(v, (int, float)) and v != 0}
-
-    print("\n📌 μ pipeline...")
-    mu, mu_source = compute_expected_returns_pipeline(
-        tickers_list=available_tickers,
-        daily_returns=daily,
-        cov_matrix=cov,
-        dcf_upsides=dcf_upsides_clean,
-        ml_predictions_5y=ml_predictions_5y,
-        country_risk_map=asset_country_risk_map,
-        country_risk_value=country_risk_argentina or 0.0
+    iol_quotes: Dict[str, IOLQuoteResult] = fetch_iol_quotes_for_instruments(
+        instruments,
+        iol_config=cfg.iol,
+        preloaded_snapshots=iol_snapshots_override,
     )
-    for t_src, src in mu_source.items():
-        print(f"  {t_src}: μ={mu[t_src]*100:.2f}% → {src}")
+    for q in iol_quotes.values():
+        warnings_list.extend(q.warnings)
 
-    rf = rf_rate
-    sample_days = daily.shape[0]
+    prices_cols: Dict[str, pd.Series] = {}
+    direct_price_sources: Dict[str, str] = {}
+    proxies_used: Dict[str, str] = {}
+    missing_history_assets: List[str] = []
 
-    weights, port_ret, port_vol, cvars = _simulate_portfolios(mu, cov, daily, rf, samples)
-    sharpe = (port_ret - rf) / port_vol
+    override_df = prices_usd_override.copy() if prices_usd_override is not None else pd.DataFrame()
+    if not override_df.empty:
+        override_df.columns = [str(c).strip().upper() for c in override_df.columns]
 
-    print("\n🎯 Optimización HHI + sector + stress bounds...")
-    sector_map = get_sector_map(available_tickers)
-    stress_bounds = compute_stress_weight_caps(cov, available_tickers)
+    yfinance_download_map: Dict[str, str] = {}
+    yfinance_direct_ids: set[str] = set()
+    currency_overrides: Dict[str, str] = {}
 
-    for _stress_iter in range(3):
-        weights_sharpe = optimize_with_sector_and_stress(mu, cov, rf, available_tickers,
-                                                          hhi_limit=0.35, max_sector_weight=0.40,
-                                                          sector_map=sector_map, stress_bounds=stress_bounds)
-        weights_minvar = _optimize_min_variance(mu, cov, stress_bounds=stress_bounds)
-        weights_cvar = _optimize_min_cvar(mu, cov, daily, stress_bounds=stress_bounds)
+    for inst in instruments:
+        iid = inst.instrument_id
+        if not override_df.empty and iid in override_df.columns:
+            prices_cols[iid] = override_df[iid]
+            direct_price_sources[iid] = "prices_usd_override"
+            continue
+        if not override_df.empty and inst.ticker.upper() in override_df.columns:
+            prices_cols[iid] = override_df[inst.ticker.upper()]
+            direct_price_sources[iid] = "prices_usd_override"
+            continue
 
-        _tightened = False
-        for _w_test in [weights_sharpe, weights_minvar, weights_cvar]:
-            _st = stress_test_corr_one(_w_test, cov, available_tickers)
-            for _i, _t in enumerate(available_tickers):
-                if _st['stress_contributions'][_t] > 0.20:
-                    _old_floor, _old_ceil = stress_bounds[_i]
-                    _new_ceil = max(_old_floor, _old_ceil * 0.70)
-                    if _new_ceil < _old_ceil:
-                        stress_bounds[_i] = (_old_floor, _new_ceil)
-                        _tightened = True
-                        print(f"  ⚡ Stress limiter: {_t} cap {_old_ceil*100:.0f}%→{_new_ceil*100:.0f}%")
-        if not _tightened:
-            break
-    if _stress_iter > 0:
-        print(f"  Stress limiter: {_stress_iter + 1} iteraciones")
+        if inst.quote_source == "yfinance":
+            yfinance_download_map[iid] = inst.ticker
+            yfinance_direct_ids.add(iid)
+            # AUD-01: ONLY forward explicit user-declared currency overrides (default is None = auto-detect)
+            if inst.currency is not None:
+                currency_overrides[inst.ticker.upper()] = inst.currency
+        else:
+            if inst.historical_proxy_ticker and cfg.risk.allow_explicit_proxies:
+                proxy_tkr = inst.historical_proxy_ticker.strip().upper()
+                if not override_df.empty and proxy_tkr in override_df.columns:
+                    prices_cols[iid] = override_df[proxy_tkr]
+                else:
+                    yfinance_download_map[iid] = inst.historical_proxy_ticker
+                proxies_used[iid] = inst.historical_proxy_ticker
+                warnings_list.append(
+                    f"Instrument '{iid}' lacks direct historical USD prices; using user-approved explicit proxy "
+                    f"'{inst.historical_proxy_ticker}' for weekly risk estimation. Proxy tracking error is not captured."
+                )
+            else:
+                missing_history_assets.append(iid)
 
-    stats_sharpe = _portfolio_metrics(weights_sharpe, mu, cov, daily, rf)
-    stats_minvar = _portfolio_metrics(weights_minvar, mu, cov, daily, rf)
-    stats_cvar = _portfolio_metrics(weights_cvar, mu, cov, daily, rf)
+    fx_diagnostics: Dict[str, FXConversionDiagnostics] = {}
+    unadjusted_closes: Dict[str, pd.Series] = {}
+    if yfinance_download_map:
+        unique_dl_tickers = list(dict.fromkeys(yfinance_download_map.values()))
+        # AUD-10: allow_partial=False propagates FXConversionError / DataQualityError directly with exact asset_id & cause
+        downloaded_df, _ = _download_prices(
+            unique_dl_tickers,
+            period=cfg.risk.period,
+            fx_max_staleness_days=cfg.risk.fx_max_staleness_days,
+            min_fx_coverage=cfg.risk.min_fx_coverage,
+            duplicate_date_policy=cfg.risk.duplicate_date_policy,
+            currency_overrides=currency_overrides,
+            as_of_cutoff=as_of_cutoff,
+            target_tz=cfg.risk.weekly_cutoff_tz,
+            allow_partial=False,
+            fx_diagnostics_out=fx_diagnostics,
+            unadjusted_close_out=unadjusted_closes,
+        )
+        for diag in fx_diagnostics.values():
+            warnings_list.extend(diag.warnings)
+        for iid, dl_tkr in yfinance_download_map.items():
+            key = dl_tkr.upper()
+            if downloaded_df.empty or key not in downloaded_df.columns:
+                missing_history_assets.append(iid)
+            else:
+                prices_cols[iid] = downloaded_df[key]
+                if iid in yfinance_direct_ids:
+                    direct_price_sources[iid] = "yfinance"
 
-    mcr_sharpe = _calc_mcr(weights_sharpe, cov, available_tickers)
-    mcr_minvar = _calc_mcr(weights_minvar, cov, available_tickers)
-    mcr_cvar = _calc_mcr(weights_cvar, cov, available_tickers)
-
-    hist_performance = {
-        "sharpe": _calc_historical_performance(prices, weights_sharpe, available_tickers),
-        "minvar": _calc_historical_performance(prices, weights_minvar, available_tickers),
-        "cvar": _calc_historical_performance(prices, weights_cvar, available_tickers),
+    # NEW-01 & AUD-09: Resolve authoritative tradable market prices ONCE per instrument BEFORE
+    # fixed_income_metrics and BEFORE InsufficientHistoryError, and reuse the exact same resolution
+    # across fixed_income_metrics, latest_prices_usd, execution_prices_usd_per_unit, and rebalancing.
+    resolved_tradable_prices: Dict[str, _TradablePriceResolution] = {
+        inst.instrument_id: _resolve_tradable_market_price(
+            inst,
+            iol_quotes=iol_quotes,
+            prices_cols=prices_cols,
+            direct_price_sources=direct_price_sources,
+            unadjusted_closes=unadjusted_closes,
+            proxies_used=proxies_used,
+            duplicate_date_policy=cfg.risk.duplicate_date_policy,
+            weekly_cutoff_tz=cfg.risk.weekly_cutoff_tz,
+            as_of_cutoff=as_of_cutoff,
+            as_of_date=cfg.as_of_date,
+        )
+        for inst in instruments
     }
 
-    chart_path = _build_static_figure(mu, port_ret, port_vol, sharpe,
-                                       Path(tempfile.gettempdir()) / "portfolio_chart.png")
-    weights_dict = {"sharpe": weights_sharpe, "minvar": weights_minvar, "cvar": weights_cvar}
-    historical_perf_chart_path = _build_historical_performance_plot(
-        prices, weights_dict, available_tickers, Path(tempfile.gettempdir()) / "historical_perf_chart.png")
-    correlation_heatmap_path = _build_correlation_heatmap(
-        prices, available_tickers, Path(tempfile.gettempdir()) / "correlation_heatmap.png")
-    mcr_chart_path = _build_mcr_chart(
-        mcr_sharpe, mcr_minvar, mcr_cvar, cov, weights_sharpe, weights_minvar, weights_cvar,
-        available_tickers, Path(tempfile.gettempdir()) / "mcr_chart.png")
+    fixed_income_metrics: Dict[str, FixedIncomeMetricsResult] = {}
+    for inst in cfg.fixed_income:
+        if inst.fixed_income_terms is None:
+            continue
+        iid = inst.instrument_id
+        terms = inst.fixed_income_terms
+        px_res = resolved_tradable_prices[iid]
+        not_eval_reason = (
+            px_res.blocked_reason
+            if (not px_res.tradable and px_res.series_type in ("adjusted_total_return", "missing_unadjusted_close", "proxy_only"))
+            else None
+        )
 
-    if is_existing:
-        patrimonio_chart_path = _build_real_portfolio_performance(
-            prices, assets_list, sales, Path(tempfile.gettempdir()) / "patrimonio_chart.png")
-        total_return_chart_path = _build_real_portfolio_with_sales(
-            prices, assets_list, sales, Path(tempfile.gettempdir()) / "total_return_chart.png")
-        individual_returns_chart_path = _build_real_individual_returns_plot(
-            prices, assets_list, sales, available_tickers, Path(tempfile.gettempdir()) / "individual_returns_chart.png")
-    else:
-        patrimonio_chart_path = _build_patrimonio_plot(
-            prices, weights_sharpe, weights_minvar, weights_cvar, available_tickers, assets_list,
-            Path(tempfile.gettempdir()) / "patrimonio_chart.png")
-        total_return_chart_path = _build_portfolio_strategies_performance_plot(
-            prices, weights_sharpe, weights_minvar, weights_cvar, available_tickers,
-            Path(tempfile.gettempdir()) / "total_return_chart.png")
-        individual_returns_chart_path = _build_individual_returns_plot(
-            prices, available_tickers, Path(tempfile.gettempdir()) / "individual_returns_chart.png")
+        fi_res = evaluate_fixed_income_instrument(
+            iid,
+            terms,
+            quoted_price=px_res.quoted_price_for_terms,
+            quoted_price_currency=px_res.quoted_currency_for_terms,
+            quote_source_used=px_res.source,
+            valuation_price_date=px_res.price_timestamp,
+            extra_warnings=list(px_res.warnings),
+            not_evaluable_reason=not_eval_reason,
+        )
+        fixed_income_metrics[iid] = fi_res
+        warnings_list.extend(fi_res.warnings)
 
-    print("\n🔴 Stress tests: corr=1 | vol shock 2x | crisis sistémica (corr≥0.8 + vol×1.5)...")
-    stress_results = {}
-    for st_label, st_w in [('sharpe', weights_sharpe), ('minvar', weights_minvar), ('cvar', weights_cvar)]:
-        all_st = run_all_stress_tests(st_w, cov, available_tickers)
-        entry = all_st['corr_one']
-        entry['vol_shock'] = all_st['vol_shock']
-        entry['systemic'] = all_st['systemic']
-        stress_results[st_label] = entry
-    for st_name, st in [('Sharpe', stress_results['sharpe']), ('MinVar', stress_results['minvar']), ('CVaR', stress_results['cvar'])]:
-        print(f"  {st_name}: Vol {st['normal_vol']*100:.2f}%→{st['stress_vol']*100:.2f}% "
-              f"(+{st['vol_increase_pct']:.1f}%) Diversif={st['diversification_ratio']:.3f}")
-        if st['false_diversification']:
-            for rec in st['recommendations']:
-                print(f"    ⚠️ {rec}")
-        sys_st = st['systemic']
-        print(f"    Sistémico: Vol→{sys_st['stress_vol']*100:.2f}% MaxLoss1D(99%)={sys_st['max_daily_loss_99']*100:.2f}%")
+    if missing_history_assets:
+        raise InsufficientHistoryError(
+            f"Optimization blocked: instrument(s) {missing_history_assets} lack valid historical USD price series "
+            "(IOL quotes are point-in-time snapshots only; historical series are never fabricated from coupons or snapshots, "
+            "and instruments are never silently dropped). Supply historical total-return prices, or configure an explicit "
+            "proxy with risk.allow_explicit_proxies=True. Independent IOL quotes and fixed-income YTM calculations remain available.",
+            details={
+                "missing_history_assets": missing_history_assets,
+                "iol_quotes_available": list(iol_quotes.keys()),
+                "fixed_income_ytm_available": {
+                    k: v.ytm_annual for k, v in fixed_income_metrics.items() if v.status == "ok"
+                },
+            },
+        )
 
-    warnings_list: List[str] = []
-    if dropped:
-        warnings_list.append(f"Tickers sin datos: {', '.join(dropped)}")
-    if daily.shape[0] < 250:
-        warnings_list.append("La serie histórica es corta; los resultados pueden ser inestables.")
-    for stn, std in stress_results.items():
-        if std.get('false_diversification'):
-            warnings_list.append(f"Stress test ({stn}): Falsa diversificación (ratio={std['diversification_ratio']:.3f})")
+    aligned_price_cols = {
+        iid: pd.Series(
+            prices_cols[iid].to_numpy(),
+            index=_normalize_datetime_index(
+                prices_cols[iid].index,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+                strip_tz=True,
+            ),
+            name=iid,
+        )
+        for iid in ordered_ids
+    }
+    prices_usd = pd.DataFrame(aligned_price_cols).sort_index(ascending=True)
+
+    weekly_bundle = compute_weekly_returns_w_fri(
+        prices_usd,
+        risk_config=cfg.risk,
+        as_of_cutoff=as_of_cutoff,
+    )
+
+    vix_hist: Optional[pd.Series] = vix_history_override
+    curr_vix: Optional[float] = None
+    curr_vix_date: Optional[pd.Timestamp] = None
+    curr_vix_stale: bool = False
+
+    if cfg.risk.covariance_estimator == "vix_regime":
+        if vix_hist is None and cfg.risk.vix_regime.regime_classification_method == "vix_history":
+            vix_hist = fetch_vix_history(
+                period=cfg.risk.period,
+                as_of_cutoff=as_of_cutoff,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+            )
+
+        if current_vix_override is not None:
+            curr_vix, curr_vix_date, curr_vix_stale = current_vix_override
+        else:
+            curr_vix, curr_vix_date, curr_vix_stale = get_current_vix_observation(
+                vix_history=vix_hist,
+                as_of_date=cfg.as_of_date,
+                max_staleness_days=cfg.risk.vix_regime.max_vix_staleness_days,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+            )
+
+    risk_result: RiskModelResult = estimate_risk_model(
+        weekly_bundle,
+        risk_config=cfg.risk,
+        vix_history=vix_hist,
+        current_vix=curr_vix,
+        current_vix_date=curr_vix_date,
+        current_vix_is_stale=curr_vix_stale,
+        proxies_used=proxies_used,
+    )
+    warnings_list.extend(risk_result.warnings)
+
+    # Preserve published/latest tradable market USD quote in latest_prices_usd AND compute canonical dirty
+    # execution USD price per 1 quantity unit (AUD-02 & NEW-01) from the exact same centralized resolution.
+    latest_prices_usd: Dict[str, float] = {}
+    quote_units_by_id: Dict[str, str] = {}
+    execution_prices_usd_per_unit: Dict[str, float] = {}
+    price_unit_metadata: Dict[str, Dict[str, Any]] = {}
+    unpriced_instruments: Dict[str, str] = {}
+    price_resolution_audit: Dict[str, Dict[str, Any]] = {}
+
+    for iid in ordered_ids:
+        inst = inst_map[iid]
+        px_res = resolved_tradable_prices[iid]
+        if px_res.tradable and px_res.quoted_price_usd is not None:
+            latest_prices_usd[iid] = float(px_res.quoted_price_usd)
+            if iid in iol_quotes:
+                quote_units_by_id[iid] = iol_quotes[iid].quote_unit
+            unit_px, unit_meta = normalize_execution_price_to_usd_per_unit(
+                inst,
+                latest_prices_usd[iid],
+                quote_unit_override=quote_units_by_id.get(iid),
+            )
+            execution_prices_usd_per_unit[iid] = float(unit_px)
+            price_unit_metadata[iid] = unit_meta
+            warnings_list.extend(unit_meta.get("warnings", []))
+            price_resolution_audit[iid] = {
+                "instrument_id": iid,
+                "tradable": True,
+                "source": px_res.source,
+                "series_type": px_res.series_type,
+                "currency": "USD",
+                "quoted_price_usd": latest_prices_usd[iid],
+                "execution_price_usd_per_unit": execution_prices_usd_per_unit[iid],
+                "quote_unit": unit_meta.get("quote_unit"),
+                "price_type": unit_meta.get("price_type"),
+                "price_timestamp": px_res.price_timestamp,
+                "blocked_reason": None,
+            }
+        else:
+            reason = px_res.blocked_reason or f"Instrument '{iid}' lacks a tradable USD market price."
+            unpriced_instruments[iid] = reason
+            warnings_list.append(reason)
+            price_resolution_audit[iid] = {
+                "instrument_id": iid,
+                "tradable": False,
+                "source": px_res.source,
+                "series_type": px_res.series_type,
+                "currency": None,
+                "quoted_price_usd": None,
+                "execution_price_usd_per_unit": None,
+                "quote_unit": px_res.quote_unit,
+                "price_type": inst.fixed_income_terms.price_type if inst.fixed_income_terms is not None else None,
+                "price_timestamp": px_res.price_timestamp,
+                "blocked_reason": reason,
+            }
+
+    rf_rate = (
+        float(cfg.black_litterman.rf_rate)
+        if cfg.black_litterman.rf_rate is not None
+        else get_risk_free_rate(default=cfg.black_litterman.default_rf_rate)
+    )
+
+    m_caps = market_caps_override
+    if m_caps is None and cfg.black_litterman.prior_weights_policy in ("market_cap_equity_only", "explicit_or_warned_equal_weight"):
+        all_equity = all(inst.asset_subtype in ("equity", "equity_etf") for inst in instruments)
+        has_explicit_all = all(iid in cfg.black_litterman.reference_weights for iid in ordered_ids)
+        if all_equity and not has_explicit_all:
+            raw_caps = get_market_caps([inst.ticker for inst in instruments])
+            m_caps = {inst.instrument_id: raw_caps[inst.ticker.upper()] for inst in instruments if inst.ticker.upper() in raw_caps}
+
+    bl_result = compute_expected_returns_pipeline(
+        tickers=ordered_ids,
+        cov_matrix=risk_result.cov_matrix,
+        rf_rate=rf_rate,
+        bl_config=cfg.black_litterman,
+        instruments_by_id=inst_map,
+        latest_prices_usd=latest_prices_usd,
+        fixed_income_metrics=fixed_income_metrics,
+        market_caps=m_caps,
+    )
+    warnings_list.extend(bl_result.warnings)
+
+    risk_class_by_ticker = {inst.instrument_id: str(inst.risk_class) for inst in instruments}
+    sector_by_ticker = sector_map_override
+    if sector_by_ticker is None and cfg.constraints.max_sector_weight is not None:
+        raw_sec = get_sector_map([inst.ticker for inst in instruments])
+        sector_by_ticker = {inst.instrument_id: raw_sec.get(inst.ticker.upper(), "Unknown") for inst in instruments}
+
+    resolved_constraints = validate_constraints_feasibility(
+        ordered_ids,
+        cfg.constraints,
+        risk_class_by_ticker=risk_class_by_ticker,
+        sector_by_ticker=sector_by_ticker,
+    )
+
+    strategies: Dict[str, StrategyAllocationResult] = {}
+    mu_post = bl_result.posterior_total_returns
+
+    for strat_name in cfg.optimization.strategies_to_run:
+        if strat_name == "max_sharpe":
+            strategies[strat_name] = optimize_max_sharpe(
+                mu_post,
+                risk_result.cov_matrix,
+                rf_rate,
+                resolved_constraints,
+                weekly_returns=risk_result.weekly_returns,
+                cvar_confidence=cfg.optimization.cvar_confidence,
+                non_positive_excess_return_policy=cfg.optimization.non_positive_excess_return_policy,
+            )
+        elif strat_name == "min_variance":
+            strategies[strat_name] = optimize_min_variance(
+                risk_result.cov_matrix,
+                resolved_constraints,
+                mu=mu_post,
+                rf=rf_rate,
+                weekly_returns=risk_result.weekly_returns,
+                cvar_confidence=cfg.optimization.cvar_confidence,
+            )
+        elif strat_name == "min_cvar":
+            strategies[strat_name] = optimize_min_cvar(
+                risk_result.weekly_returns,
+                risk_result.cov_matrix,
+                resolved_constraints,
+                mu=mu_post,
+                rf=rf_rate,
+                cvar_confidence=cfg.optimization.cvar_confidence,
+            )
+        elif strat_name == "erc":
+            strategies[strat_name] = optimize_erc(
+                risk_result.cov_matrix,
+                resolved_constraints,
+                mu=mu_post,
+                rf=rf_rate,
+                weekly_returns=risk_result.weekly_returns,
+                cvar_confidence=cfg.optimization.cvar_confidence,
+            )
+        elif strat_name == "hrp":
+            strategies[strat_name] = optimize_hrp(
+                risk_result.cov_matrix,
+                resolved_constraints,
+                linkage_method=cfg.optimization.hrp_linkage_method,
+                mu=mu_post,
+                rf=rf_rate,
+                weekly_returns=risk_result.weekly_returns,
+                cvar_confidence=cfg.optimization.cvar_confidence,
+            )
+        else:
+            raise ConfigurationError(f"Unsupported optimization strategy '{strat_name}'.")
+        warnings_list.extend(strategies[strat_name].warnings)
+
+    stress_results: Dict[str, Dict[str, Any]] = {}
+    if cfg.optimization.include_stress_tests:
+        for strat_name, strat_res in strategies.items():
+            all_st = run_all_stress_tests(strat_res.weights, risk_result.cov_matrix, ordered_ids)
+            entry = dict(all_st["corr_one"])
+            entry["vol_shock"] = all_st["vol_shock"]
+            entry["systemic"] = all_st["systemic"]
+            stress_results[strat_name] = entry
+
+    rebalancing_results: Dict[str, Any] = {}
+    invalid_target_statuses = {
+        "non_converged",
+        "failed",
+        "singular_zero_variance",
+        "blocked_non_positive_excess",
+        "suboptimal_non_positive_excess",
+    }
+    for strat_name, strat_res in strategies.items():
+        is_valid_target = bool(strat_res.diagnostics.get("is_valid_target", True))
+        if not strat_res.converged or strat_res.status in invalid_target_statuses or not is_valid_target:
+            rebalancing_results[strat_name] = RebalancingResult(
+                strategy_name=strat_name,
+                status="skipped_invalid_strategy_target",
+                feasible=False,
+                theoretical_target_weights=dict(strat_res.weights_by_asset),
+                warnings=[
+                    f"Rebalancing skipped for strategy '{strat_name}' because optimizer did not produce an approved valid target "
+                    f"(status='{strat_res.status}', converged={strat_res.converged}, is_valid_target={is_valid_target})."
+                ],
+            )
+            continue
+        if unpriced_instruments:
+            rebalancing_results[strat_name] = RebalancingResult(
+                strategy_name=strat_name,
+                status="missing_tradable_market_price",
+                feasible=False,
+                theoretical_target_weights=dict(strat_res.weights_by_asset),
+                unpriced_instruments=dict(unpriced_instruments),
+                warnings=[
+                    f"Rebalancing blocked for strategy '{strat_name}' because instrument(s) "
+                    f"{sorted(unpriced_instruments.keys())} lack a tradable USD market price "
+                    "(adjusted total-return series and risk proxies cannot value holdings or size orders): "
+                    + "; ".join(f"{k}: {v}" for k, v in sorted(unpriced_instruments.items()))
+                ],
+            )
+            continue
+        reb = compute_rebalancing_plan(
+            strategy_name=strat_name,
+            tickers=ordered_ids,
+            target_weights=strat_res.weights_by_asset,
+            prices_usd=latest_prices_usd,
+            instruments_by_id=inst_map,
+            brokers_by_id=cfg.broker_map,
+            positions=cfg.positions,
+            rebalancing_config=cfg.rebalancing,
+            constraints_config=cfg.constraints,
+            sector_by_ticker=sector_by_ticker,
+            quote_units_by_id=quote_units_by_id,
+            prices_are_dirty_per_unit=False,
+        )
+        rebalancing_results[strat_name] = reb
+
+    unique_warnings = list(dict.fromkeys(warnings_list))
+
+    quotes_and_dq = {
+        "iol_quotes": {k: v.to_dict() for k, v in iol_quotes.items()},
+        "latest_prices_usd": latest_prices_usd,
+        "execution_prices_usd_per_unit": execution_prices_usd_per_unit,
+        "price_unit_metadata": price_unit_metadata,
+        "price_resolution": price_resolution_audit,
+        "unpriced_instruments": unpriced_instruments,
+        "fx_diagnostics": {
+            k: {
+                "original_currency": d.original_currency,
+                "economic_currency": d.economic_currency,
+                "fx_symbol": d.fx_symbol,
+                "direction": d.direction,
+                "unit_scale": d.unit_scale,
+                "coverage_ratio": d.coverage_ratio,
+                "dropped_stale_or_missing_fx": d.dropped_stale_or_missing_fx,
+            }
+            for k, d in fx_diagnostics.items()
+        },
+        "weekly_alignment": {
+            "frequency": cfg.risk.return_frequency,
+            "cutoff_tz": cfg.risk.weekly_cutoff_tz,
+            "cutoff_hour": cfg.risk.weekly_cutoff_hour,
+            "last_closed_friday": risk_result.last_closed_friday,
+            "excluded_incomplete_week_bins": risk_result.excluded_incomplete_week_bins,
+            "total_grid_weeks": weekly_bundle.total_grid_weeks,
+            "aligned_weeks": weekly_bundle.aligned_weeks,
+            "excluded_dates_count": weekly_bundle.excluded_dates_count,
+            "missing_weeks_by_asset": weekly_bundle.missing_weeks_by_asset,
+            "coverage_by_asset": weekly_bundle.coverage_by_asset,
+            "duplicate_dates_removed": weekly_bundle.duplicate_dates_removed,
+        },
+        "proxies_used": proxies_used,
+    }
+
+    constraints_summary = {
+        "long_only": cfg.constraints.long_only,
+        "budget_sum": cfg.constraints.budget_sum,
+        "asset_bounds": {t: list(b) for t, b in zip(resolved_constraints.tickers, resolved_constraints.bounds)},
+        "class_bounds": {k: list(v) for k, v in resolved_constraints.class_bounds.items()},
+        "hhi_limit": resolved_constraints.hhi_limit,
+        "max_sector_weight": resolved_constraints.max_sector_weight,
+        "feasible": True,
+    }
 
     return AnalysisResult(
-        tickers=available_tickers,
-        expected_returns=mu,
-        cov_matrix=cov,
-        weights_sharpe=weights_sharpe,
-        weights_minvar=weights_minvar,
-        weights_cvar=weights_cvar,
-        chart_path=chart_path,
-        warnings=warnings_list,
-        stats_sharpe=stats_sharpe,
-        stats_minvar=stats_minvar,
-        stats_cvar=stats_cvar,
-        start_date=start_date,
-        end_date=end_date,
-        sample_days=sample_days,
-        used_expected=dcf_upsides_clean,
-        hist_performance=hist_performance,
-        mcr_sharpe=mcr_sharpe,
-        mcr_minvar=mcr_minvar,
-        mcr_cvar=mcr_cvar,
-        prices_hist=prices,
-        historical_perf_chart_path=historical_perf_chart_path,
-        correlation_heatmap_path=correlation_heatmap_path,
-        mcr_chart_path=mcr_chart_path,
-        patrimonio_chart_path=patrimonio_chart_path,
-        total_return_chart_path=total_return_chart_path,
-        individual_returns_chart_path=individual_returns_chart_path,
-        is_existing_portfolio=is_existing,
+        tickers=ordered_ids,
+        selected_strategy=cfg.optimization.selected_strategy,
+        config_snapshot=cfg.to_dict(),
+        quotes_and_data_quality=quotes_and_dq,
+        dcf_views=bl_result.dcf_view_results,
+        fixed_income_metrics=fixed_income_metrics,
+        black_litterman=bl_result,
+        risk_model=risk_result,
+        constraints_summary=constraints_summary,
+        strategies=strategies,
         stress_test_results=stress_results,
-        mu_sources=mu_source,
-        vix_level=vix_current,
-        cov_inflation_factor=cov_inflation,
+        rebalancing=rebalancing_results,
+        prices_hist=prices_usd,
+        warnings=unique_warnings,
+        errors=[],
     )
