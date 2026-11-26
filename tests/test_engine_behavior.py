@@ -67,12 +67,26 @@ def test_download_prices_usd_inverse_direct_and_subunit_fx(monkeypatch):
 
     monkeypatch.setattr(market_data.yf, "Ticker", fake_ticker)
 
+    # Default allow_partial=False blocks immediately with FXConversionError identifying BAD
+    with pytest.raises(market_data.FXConversionError, match="Unsupported currency 'ZZZ'") as exc_info:
+        market_data._download_prices(
+            ["US1", "EU1", "BR1", "UK1.L", "BAD"],
+            period="1y",
+            fx_fetcher=fake_fx_fetcher,
+        )
+    assert exc_info.value.asset_id == "BAD"
+
+    # Explicit allow_partial=True records structured per-asset error details without silent loss
+    errors_out = {}
     prices, dropped = market_data._download_prices(
         ["US1", "EU1", "BR1", "UK1.L", "BAD"],
         period="1y",
         fx_fetcher=fake_fx_fetcher,
+        allow_partial=True,
+        errors_out=errors_out,
     )
     assert dropped == ["BAD"]
+    assert "BAD" in errors_out and errors_out["BAD"]["code"] == "fx_conversion_error"
     assert list(prices.columns) == ["US1", "EU1", "BR1", "UK1.L"]
     np.testing.assert_allclose(prices["US1"].values, 100.0)
     np.testing.assert_allclose(prices["EU1"].values, 55.0)
@@ -89,7 +103,6 @@ def test_get_risk_free_rate_paths(monkeypatch):
     t_bad = MagicMock()
     t_bad.history.side_effect = RuntimeError("no network")
     monkeypatch.setattr(market_data.yf, "Ticker", lambda _: t_bad)
-    monkeypatch.setattr(config, "FRED_API_KEY", "")
     monkeypatch.delenv("FRED_API_KEY", raising=False)
     mock_get = MagicMock()
     monkeypatch.setattr(market_data.requests, "get", mock_get)

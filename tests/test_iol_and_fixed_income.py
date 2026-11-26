@@ -166,10 +166,17 @@ def test_iol_table_selection_species_priority_and_mep_fallback():
     assert any("liquidity" in w.lower() for w in q_gd35.warnings)
     assert any("spread" in w.lower() for w in q_gd35.warnings)
 
-    q_ae38 = resolve_iol_bond_quote_usd(instrument_id="AE38", ticker="AE38", panel_snapshot=bonos)
+    # Default conservative policy blocks ARS/MEP when market timestamps are absent (simultaneity unverified)
+    with pytest.raises(IOLQuoteError, match="simultaneity cannot be verified"):
+        resolve_iol_bond_quote_usd(instrument_id="AE38", ticker="AE38", panel_snapshot=bonos)
+
+    # Explicit opt-in accepts unverified simultaneity with explicit diagnostic flag and warning
+    opt_in_cfg = IOLConfig(allow_mep_without_market_timestamp=True)
+    q_ae38 = resolve_iol_bond_quote_usd(instrument_id="AE38", ticker="AE38", panel_snapshot=bonos, iol_config=opt_in_cfg)
     assert q_ae38.species_used == "AE38"
     assert q_ae38.conversion_method == "ARS/MEP"
     assert q_ae38.usd_settlement_type == "USD_MEP_IMPLIED"
+    assert q_ae38.mep_reference["simultaneity_verified"] is False
     assert q_ae38.mep_reference["mep_rate_ars_per_usd"] == pytest.approx(1200.0)
     assert q_ae38.price_usd == pytest.approx(50.0)
 
@@ -178,7 +185,9 @@ def test_iol_table_selection_species_priority_and_mep_fallback():
     assert q_mtcg.conversion_method == "D"
     assert q_mtcg.price_usd == pytest.approx(100.70)
 
-    q_ymcq = resolve_iol_bond_quote_usd(instrument_id="YMCQO", ticker="YMCQO", panel_snapshot=ons, bonos_snapshot=bonos)
+    q_ymcq = resolve_iol_bond_quote_usd(
+        instrument_id="YMCQO", ticker="YMCQO", panel_snapshot=ons, bonos_snapshot=bonos, iol_config=opt_in_cfg
+    )
     assert q_ymcq.species_used == "YMCQO"
     assert q_ymcq.conversion_method == "ARS/MEP"
     assert q_ymcq.price_usd == pytest.approx(105.0)
@@ -205,12 +214,17 @@ def test_iol_error_cases_http_missing_table_and_invalid_mep():
 
     bonos = parse_iol_fixed_income_table(BONOS_HTML_FIXTURE, panel_source="iol_bonos", observed_at="2026-11-26T15:00:00+00:00")
     with pytest.raises(IOLQuoteError, match="not contemporaneous"):
-        compute_implicit_mep_al30(bonos, reference_observed_at="2026-11-26T16:30:00+00:00", max_time_skew_seconds=300.0)
+        compute_implicit_mep_al30(
+            bonos,
+            reference_observed_at="2026-11-26T16:30:00+00:00",
+            max_time_skew_seconds=300.0,
+            allow_missing_market_timestamp=True,
+        )
 
     bad_mep_html = BONOS_HTML_FIXTURE.replace("75.000,00", "50,00")
     bad_bonos = parse_iol_fixed_income_table(bad_mep_html, panel_source="iol_bonos")
     with pytest.raises(IOLQuoteError, match="non-comparable"):
-        compute_implicit_mep_al30(bad_bonos)
+        compute_implicit_mep_al30(bad_bonos, allow_missing_market_timestamp=True)
 
     ambig_html = ONS_HTML_FIXTURE.replace("MTCGO Mastellone Cl. G", "ABCD Random Issuer")
     ambig_ons = parse_iol_fixed_income_table(ambig_html, panel_source="iol_ons")
@@ -223,6 +237,7 @@ def test_iol_error_cases_http_missing_table_and_invalid_mep():
     mock_sess.get.side_effect = lambda url, **kwargs: bonos_resp if "bonos" in url else ons_resp
     fetched = fetch_iol_quotes_for_instruments(
         [InstrumentConfig(instrument_id="YMCQO", ticker="YMCQO", section="fixed_income", asset_subtype="corporate_bond_on", quote_source="iol_ons")],
+        iol_config=IOLConfig(allow_mep_without_market_timestamp=True),
         session=mock_sess,
     )
     assert fetched["YMCQO"].conversion_method == "ARS/MEP"

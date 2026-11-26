@@ -223,6 +223,8 @@ def test_broker_commission_rules_and_rebalancing_thresholds_and_multibroker():
         BrokerPosition(instrument_id="BTC", broker_id="CRYPTO_BRK", quantity=0.01),
     ]
 
+    # Multi-broker with zero initial cash: IOL sell proceeds ($1,990) stay segregated in IOL;
+    # IBKR can ONLY spend its own AAPL sell proceeds ($999) to buy GLD -> partially_funded!
     reb = compute_rebalancing_plan(
         strategy_name="erc",
         tickers=["AAPL", "GLD", "BTC"],
@@ -233,8 +235,8 @@ def test_broker_commission_rules_and_rebalancing_thresholds_and_multibroker():
         positions=positions,
         rebalancing_config=RebalancingConfig(min_weight_diff=0.01, min_notional_usd=25.0),
     )
-    assert reb.feasible is True
-    assert reb.status == "ok"
+    assert reb.feasible is False
+    assert reb.status == "partially_funded"
 
     omitted_ids = {o.instrument_id for o in reb.omitted_operations}
     assert "BTC" in omitted_ids
@@ -246,15 +248,20 @@ def test_broker_commission_rules_and_rebalancing_thresholds_and_multibroker():
 
     gld_buys = [o for o in reb.orders if o.instrument_id == "GLD" and o.side == "BUY"]
     assert len(gld_buys) == 1
+    assert gld_buys[0].broker_id == "IBKR"
     assert gld_buys[0].quantity % 1 != 0
-    assert reb.ending_cash_usd >= -1e-6
+    assert gld_buys[0].gross_amount_usd == pytest.approx(998.0, abs=1e-4)
+    assert reb.ending_cash_by_broker["IOL"] == pytest.approx(1990.0, abs=1e-6)
+    assert reb.ending_cash_by_broker["IBKR"] == pytest.approx(0.0, abs=1e-6)
+    assert reb.ending_cash_usd == pytest.approx(1990.0, abs=1e-6)
 
     assert reb.final_portfolio_value_usd == pytest.approx(
         reb.initial_portfolio_value_usd - reb.total_transaction_cost_usd,
         abs=1e-6,
     )
 
-    reb_eq = compute_rebalancing_plan(
+    # With IBKR $1 fee and $0 cash, selling $50 yields $49 -> scaled buy is $48 < min_notional_usd ($50) -> omitted (AUD-11)
+    reb_eq_fee_omits = compute_rebalancing_plan(
         strategy_name="erc",
         tickers=["AAPL", "GLD"],
         target_weights={"AAPL": 0.51, "GLD": 0.49},
@@ -267,6 +274,28 @@ def test_broker_commission_rules_and_rebalancing_thresholds_and_multibroker():
         ],
         rebalancing_config=RebalancingConfig(min_weight_diff=0.01, min_notional_usd=50.0, threshold_comparison=">="),
     )
+    assert len(reb_eq_fee_omits.orders) == 1
+    assert any(o.instrument_id == "AAPL" and "scaled_notional" in ";".join(o.reasons) for o in reb_eq_fee_omits.omitted_operations)
+
+    # Exact boundary >= vs > tested with zero-fee broker (exact $50.00 notional & 1.00 pp weight diff)
+    zero_broker = BrokerConfig(broker_id="ZERO", fee_structure="percentage", buy_percentage_fee=0.0, sell_percentage_fee=0.0)
+    inst_zero = {
+        "AAPL": InstrumentConfig(instrument_id="AAPL", ticker="AAPL", asset_subtype="equity", default_buy_broker_id="ZERO"),
+        "GLD": InstrumentConfig(instrument_id="GLD", ticker="GLD", asset_subtype="commodity_gold", default_buy_broker_id="ZERO"),
+    }
+    reb_eq = compute_rebalancing_plan(
+        strategy_name="erc",
+        tickers=["AAPL", "GLD"],
+        target_weights={"AAPL": 0.51, "GLD": 0.49},
+        prices_usd={"AAPL": 100.0, "GLD": 100.0},
+        instruments_by_id=inst_zero,
+        brokers_by_id={"ZERO": zero_broker},
+        positions=[
+            BrokerPosition(instrument_id="AAPL", broker_id="ZERO", quantity=25.0),
+            BrokerPosition(instrument_id="GLD", broker_id="ZERO", quantity=25.0),
+        ],
+        rebalancing_config=RebalancingConfig(min_weight_diff=0.01, min_notional_usd=50.0, threshold_comparison=">="),
+    )
     assert len(reb_eq.orders) == 2
 
     reb_gt = compute_rebalancing_plan(
@@ -274,11 +303,11 @@ def test_broker_commission_rules_and_rebalancing_thresholds_and_multibroker():
         tickers=["AAPL", "GLD"],
         target_weights={"AAPL": 0.51, "GLD": 0.49},
         prices_usd={"AAPL": 100.0, "GLD": 100.0},
-        instruments_by_id={"AAPL": insts["AAPL"], "GLD": insts["GLD"]},
-        brokers_by_id={"IBKR": brokers["IBKR"]},
+        instruments_by_id=inst_zero,
+        brokers_by_id={"ZERO": zero_broker},
         positions=[
-            BrokerPosition(instrument_id="AAPL", broker_id="IBKR", quantity=25.0),
-            BrokerPosition(instrument_id="GLD", broker_id="IBKR", quantity=25.0),
+            BrokerPosition(instrument_id="AAPL", broker_id="ZERO", quantity=25.0),
+            BrokerPosition(instrument_id="GLD", broker_id="ZERO", quantity=25.0),
         ],
         rebalancing_config=RebalancingConfig(min_weight_diff=0.01, min_notional_usd=50.0, threshold_comparison=">"),
     )

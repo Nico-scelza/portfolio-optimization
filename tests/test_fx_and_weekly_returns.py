@@ -133,6 +133,7 @@ def test_weekly_w_fri_holidays_24x7_crypto_and_no_multiweek_gap_returns():
     b_intra = compute_weekly_returns_w_fri(
         crypto_intraday,
         risk_config=RiskModelConfig(min_weekly_observations=4, weekly_cutoff_hour=17),
+        as_of_cutoff=pd.Timestamp("2025-02-07 18:00:00", tz="America/New_York"),
     )
     assert b_intra.weekly_prices_usd.loc[pd.Timestamp("2025-01-10"), "BTC"] == pytest.approx(100.0)
     assert b_intra.weekly_returns.loc[pd.Timestamp("2025-01-17"), "BTC"] == pytest.approx(0.10)
