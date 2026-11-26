@@ -40,6 +40,7 @@ from .iol import IOLPanelSnapshot, fetch_iol_quotes_for_instruments
 from .market_data import (
     FXConversionDiagnostics,
     _download_prices,
+    _normalize_datetime_index,
     calcular_cvar_historico,
     compute_weekly_returns_w_fri,
     fetch_vix_history,
@@ -2130,6 +2131,7 @@ def analyze_portfolio(
             duplicate_date_policy=cfg.risk.duplicate_date_policy,
             currency_overrides=currency_overrides,
             as_of_cutoff=as_of_cutoff,
+            target_tz=cfg.risk.weekly_cutoff_tz,
             allow_partial=False,
             fx_diagnostics_out=fx_diagnostics,
             unadjusted_close_out=unadjusted_closes,
@@ -2205,7 +2207,19 @@ def analyze_portfolio(
             },
         )
 
-    prices_usd = pd.DataFrame({iid: prices_cols[iid] for iid in ordered_ids}).sort_index(ascending=True)
+    aligned_price_cols = {
+        iid: pd.Series(
+            prices_cols[iid].to_numpy(),
+            index=_normalize_datetime_index(
+                prices_cols[iid].index,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+                strip_tz=True,
+            ),
+            name=iid,
+        )
+        for iid in ordered_ids
+    }
+    prices_usd = pd.DataFrame(aligned_price_cols).sort_index(ascending=True)
 
     weekly_bundle = compute_weekly_returns_w_fri(
         prices_usd,
@@ -2220,7 +2234,11 @@ def analyze_portfolio(
 
     if cfg.risk.covariance_estimator == "vix_regime":
         if vix_hist is None and cfg.risk.vix_regime.regime_classification_method == "vix_history":
-            vix_hist = fetch_vix_history(period=cfg.risk.period, as_of_cutoff=as_of_cutoff)
+            vix_hist = fetch_vix_history(
+                period=cfg.risk.period,
+                as_of_cutoff=as_of_cutoff,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+            )
 
         if current_vix_override is not None:
             curr_vix, curr_vix_date, curr_vix_stale = current_vix_override
@@ -2229,6 +2247,7 @@ def analyze_portfolio(
                 vix_history=vix_hist,
                 as_of_date=cfg.as_of_date,
                 max_staleness_days=cfg.risk.vix_regime.max_vix_staleness_days,
+                target_tz=cfg.risk.weekly_cutoff_tz,
             )
 
     risk_result: RiskModelResult = estimate_risk_model(
