@@ -41,14 +41,21 @@ from .schemas import (
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 
-FRED_API_KEY: str = os.getenv("FRED_API_KEY", "").strip()
-
 
 def get_fred_api_key() -> str:
-    """Return configured FRED API key (empty string if unset)."""
-    if FRED_API_KEY:
-        return FRED_API_KEY
+    """Return configured FRED API key dynamically from environment (empty string if unset).
+
+    Reads ``os.getenv("FRED_API_KEY")`` on every invocation so secret rotation or
+    removal in process environment takes effect immediately without import-time caching.
+    """
     return os.getenv("FRED_API_KEY", "").strip()
+
+
+def __getattr__(name: str) -> str:
+    """Dynamic attribute fallback for ``FRED_API_KEY`` without import-time caching."""
+    if name == "FRED_API_KEY":
+        return get_fred_api_key()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _redact_secret(text: str, secret: str) -> str:

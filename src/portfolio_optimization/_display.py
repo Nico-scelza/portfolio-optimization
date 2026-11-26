@@ -1,8 +1,9 @@
-"""Optional IPython display helpers with headless fallback."""
+"""Optional IPython display helpers with headless fallback and concurrent isolation."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Iterator
 
 try:
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover - headless environments without IPython
     _IPYTHON_DISPLAY = None
     HAS_IPYTHON = False
 
-_DISPLAY_ENABLED = True
+_DISPLAY_ENABLED_VAR: ContextVar[bool] = ContextVar("portfolio_display_enabled", default=True)
 
 
 class _HeadlessContent:
@@ -46,32 +47,39 @@ def Markdown(data: Any = None, **kwargs: Any) -> Any:
     return _HeadlessContent(data)
 
 
+def is_display_enabled() -> bool:
+    """Return whether IPython display is enabled in the current thread/coroutine context."""
+    return bool(_DISPLAY_ENABLED_VAR.get())
+
+
 def display(*objs: Any, **kwargs: Any) -> None:
-    if not _DISPLAY_ENABLED:
+    if not _DISPLAY_ENABLED_VAR.get():
         return
     if _IPYTHON_DISPLAY is not None:
         _IPYTHON_DISPLAY(*objs, **kwargs)
 
 
 def clear_output(wait: bool = False) -> None:
-    if not _DISPLAY_ENABLED:
+    if not _DISPLAY_ENABLED_VAR.get():
         return
     if _IPYTHON_CLEAR_OUTPUT is not None:
         _IPYTHON_CLEAR_OUTPUT(wait=wait)
 
 
 def set_display_enabled(enabled: bool) -> None:
-    global _DISPLAY_ENABLED
-    _DISPLAY_ENABLED = bool(enabled)
+    """Set display flag strictly for the current execution context (ContextVar)."""
+    _DISPLAY_ENABLED_VAR.set(bool(enabled))
 
 
 @contextmanager
 def suppress_display() -> Iterator[None]:
-    """Temporarily silence IPython display calls (e.g., for headless backend runs)."""
-    global _DISPLAY_ENABLED
-    previous = _DISPLAY_ENABLED
-    _DISPLAY_ENABLED = False
+    """Temporarily silence IPython display calls in the current thread/task only.
+
+    Uses ``contextvars.ContextVar`` with token reset so concurrent threads and
+    asyncio coroutines are completely isolated and nested contexts restore cleanly.
+    """
+    token = _DISPLAY_ENABLED_VAR.set(False)
     try:
         yield
     finally:
-        _DISPLAY_ENABLED = previous
+        _DISPLAY_ENABLED_VAR.reset(token)

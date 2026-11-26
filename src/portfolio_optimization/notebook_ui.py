@@ -7,6 +7,7 @@ in-memory configuration/result objects passed by the caller.
 
 from __future__ import annotations
 
+import html as html_lib
 from typing import Any, Dict, Optional
 
 import yfinance as yf
@@ -27,7 +28,7 @@ def obtener_info_activo(ticker: str) -> Dict[str, Any]:
         return {
             "ticker": tkr,
             "nombre": info.get("longName") or info.get("shortName") or tkr,
-            "currency": info.get("currency", "USD"),
+            "currency": info.get("currency"),
             "market": info.get("exchange", "US"),
             "country": info.get("country"),  # Descriptive/calendar metadata only
             "precio_actual": precio_actual,
@@ -51,19 +52,24 @@ def mostrar_rebalanceo(
     strategy_name: Optional[str] = None,
 ) -> None:
     """Display indicative multi-broker rebalancing orders from an ``AnalysisResult``."""
-    strat_key = strategy_name or result.selected_strategy
+    strat_key = str(strategy_name or result.selected_strategy)
+    safe_strat = html_lib.escape(strat_key, quote=True)
     reb = result.rebalancing.get(strat_key)
     if reb is None:
-        display(HTML(f"<p>No rebalancing result available for strategy <b>{strat_key}</b>.</p>"))
+        display(HTML(f"<p>No rebalancing result available for strategy <b>{safe_strat}</b>.</p>"))
         return
 
+    safe_status = html_lib.escape(str(reb.status), quote=True)
     rows_html = ""
     for order in reb.orders:
+        safe_broker = html_lib.escape(str(order.broker_id), quote=True)
+        safe_inst = html_lib.escape(str(order.instrument_id), quote=True)
+        safe_side = html_lib.escape(str(order.side), quote=True)
         rows_html += (
             f"<tr>"
-            f"<td>{order.broker_id}</td>"
-            f"<td>{order.instrument_id}</td>"
-            f"<td>{order.side}</td>"
+            f"<td>{safe_broker}</td>"
+            f"<td>{safe_inst}</td>"
+            f"<td>{safe_side}</td>"
             f"<td>{order.quantity:.6f}</td>"
             f"<td>${order.gross_amount_usd:,.2f}</td>"
             f"<td>${order.commission_usd:,.2f}</td>"
@@ -74,7 +80,7 @@ def mostrar_rebalanceo(
 
     html = f"""
     <div>
-        <h3>Indicative Rebalancing Proposal ({strat_key}) — Status: {reb.status}</h3>
+        <h3>Indicative Rebalancing Proposal ({safe_strat}) — Status: {safe_status}</h3>
         <table border="1" cellpadding="6" cellspacing="0">
             <thead>
                 <tr>
