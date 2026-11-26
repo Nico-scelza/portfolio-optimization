@@ -1,0 +1,22 @@
+# Core engine dependencies (versions were not observable in the source Colab
+# notebook except where noted below; no lockfile is invented).
+numpy
+pandas
+matplotlib
+requests
+urllib3
+beautifulsoup4
+yfinance
+xgboost
+scikit-learn
+scipy
+tqdm
+jinja2
+
+# Optional notebook / legacy UI imports from the source notebook
+# (Cell 00 observed feedparser==6.0.12 and tkhtmlview==0.3.2 on Python 3.12.12).
+ipython
+ipywidgets
+plotly
+feedparser
+tkhtmlview
