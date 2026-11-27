@@ -8,13 +8,13 @@ and zero country-risk spreads.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import pandas as pd
 
 from ._display import HTML, Markdown, display, suppress_display
 from .errors import ConfigurationError
-from .iol import IOLPanelSnapshot
+from .iol import IOLHistoricalSeries, IOLPanelSnapshot
 from .optimization import analyze_portfolio
 from .schemas import REMOVED_LEGACY_KEYS, AnalysisResult, PortfolioAnalysisConfig
 
@@ -69,6 +69,8 @@ def ejecutar_analisis_completo(
     vix_history_override: Optional[pd.Series] = None,
     current_vix_override: Optional[Tuple[Optional[float], Optional[pd.Timestamp], bool]] = None,
     iol_snapshots_override: Optional[Dict[str, IOLPanelSnapshot]] = None,
+    iol_history_override: Optional[Dict[str, IOLHistoricalSeries]] = None,
+    iol_history_fetcher: Optional[Callable[..., IOLHistoricalSeries]] = None,
     market_caps_override: Optional[Dict[str, float]] = None,
     sector_map_override: Optional[Dict[str, str]] = None,
     **unexpected_kwargs: Any,
@@ -90,6 +92,8 @@ def ejecutar_analisis_completo(
         vix_history_override=vix_history_override,
         current_vix_override=current_vix_override,
         iol_snapshots_override=iol_snapshots_override,
+        iol_history_override=iol_history_override,
+        iol_history_fetcher=iol_history_fetcher,
         market_caps_override=market_caps_override,
         sector_map_override=sector_map_override,
     )
@@ -107,6 +111,8 @@ def run_portfolio_analysis(
     vix_history_override: Optional[pd.Series] = None,
     current_vix_override: Optional[Tuple[Optional[float], Optional[pd.Timestamp], bool]] = None,
     iol_snapshots_override: Optional[Dict[str, IOLPanelSnapshot]] = None,
+    iol_history_override: Optional[Dict[str, IOLHistoricalSeries]] = None,
+    iol_history_fetcher: Optional[Callable[..., IOLHistoricalSeries]] = None,
     market_caps_override: Optional[Dict[str, float]] = None,
     sector_map_override: Optional[Dict[str, str]] = None,
     **unexpected_kwargs: Any,
@@ -120,6 +126,8 @@ def run_portfolio_analysis(
             vix_history_override=vix_history_override,
             current_vix_override=current_vix_override,
             iol_snapshots_override=iol_snapshots_override,
+            iol_history_override=iol_history_override,
+            iol_history_fetcher=iol_history_fetcher,
             market_caps_override=market_caps_override,
             sector_map_override=sector_map_override,
             **unexpected_kwargs,
@@ -132,6 +140,8 @@ def run_portfolio_analysis(
             vix_history_override=vix_history_override,
             current_vix_override=current_vix_override,
             iol_snapshots_override=iol_snapshots_override,
+            iol_history_override=iol_history_override,
+            iol_history_fetcher=iol_history_fetcher,
             market_caps_override=market_caps_override,
             sector_map_override=sector_map_override,
             **unexpected_kwargs,

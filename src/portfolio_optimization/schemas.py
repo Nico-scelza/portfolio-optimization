@@ -12,6 +12,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -92,6 +93,8 @@ VALID_HRP_LINKAGES = ("single", "complete", "average", "ward")
 VALID_NON_POSITIVE_EXCESS_POLICIES = ("block", "allow_with_warning")
 VALID_ACCRUED_BASES = ("quote_convention", "per_reference_nominal", "per_1_original_nominal")
 VALID_HISTORICAL_PRICE_TYPES = ("market_price", "adjusted_total_return")
+VALID_IOL_HISTORICAL_PRICE_FIELDS = ("close", "adjusted_close")
+VALID_IOL_HISTORICAL_FREQUENCIES = ("daily", "weekly", "monthly")
 VALID_EWMA_MEAN_MODES = ("zero", "causal_recursive")
 VALID_EWMA_GAP_POLICIES = ("elapsed_weeks_decay", "error_on_gap")
 SUBUNIT_CURRENCY_CODES = frozenset({"GBp", "GBX", "ZAc", "ZAC", "ILA", "ILX"})
@@ -600,6 +603,8 @@ class InstrumentConfig:
     default_buy_broker_id: Optional[str] = None
     sell_broker_priority: Tuple[str, ...] = field(default_factory=tuple)
     iol_species_map: Optional[Dict[str, str]] = None
+    iol_symbol: Optional[str] = None
+    iol_market: Optional[str] = None
     fixed_income_terms: Optional[FixedIncomeTerms] = None
     dcf_view: Optional[DCFViewConfig] = None
     historical_proxy_ticker: Optional[str] = None
@@ -714,6 +719,14 @@ class InstrumentConfig:
                 if str(k).strip() and str(v).strip()
             }
             object.__setattr__(self, "iol_species_map", clean_map)
+
+        if self.iol_symbol is not None:
+            sym_clean = str(self.iol_symbol).strip().upper()
+            object.__setattr__(self, "iol_symbol", sym_clean or None)
+
+        if self.iol_market is not None:
+            mkt_clean = str(self.iol_market).strip().upper()
+            object.__setattr__(self, "iol_market", mkt_clean or None)
 
         if self.fixed_income_terms is not None and not isinstance(self.fixed_income_terms, FixedIncomeTerms):
             object.__setattr__(self, "fixed_income_terms", FixedIncomeTerms.from_dict(self.fixed_income_terms))
@@ -1256,12 +1269,33 @@ class RebalancingConfig:
         return cls(**data)
 
 
+def _validate_https_url(raw_url: Any, field_name: str) -> str:
+    """Validate that a configurable endpoint URL is a well-formed HTTPS URL without credentials."""
+    url = str(raw_url or "").strip()
+    if not url:
+        raise ConfigurationError(f"'{field_name}' must be a non-empty HTTPS URL.")
+    if any(ch.isspace() or ord(ch) < 32 for ch in url):
+        raise ConfigurationError(f"'{field_name}' contains whitespace or control characters.")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ConfigurationError(
+            f"'{field_name}' must use the 'https://' scheme with a valid hostname (got '{url}')."
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigurationError(
+            f"'{field_name}' must not contain embedded URL credentials."
+        )
+    return url
+
+
 @dataclass(frozen=True)
 class IOLConfig:
-    """Editable public IOL fixed-income quote acquisition settings."""
+    """Editable public IOL fixed-income quote and historical price acquisition settings."""
 
     bonos_url: str = "https://iol.invertironline.com/mercado/cotizaciones/argentina/bonos/todos"
     ons_url: str = "https://iol.invertironline.com/mercado/cotizaciones/argentina/obligaciones-negociables/todos"
+    historical_url: str = "https://iol.invertironline.com/Titulo/DatosHistoricos"
+    default_market: str = "BCBA"
     timeout_seconds: float = 15.0
     max_mep_time_skew_seconds: float = 300.0
     max_mep_market_time_diff_seconds: float = 3600.0
@@ -1272,6 +1306,14 @@ class IOLConfig:
     low_liquidity_amount_threshold: float = 1000.0
     wide_spread_bps_threshold: float = 300.0
     min_valid_rows: int = 1
+    fetch_historical_prices: bool = True
+    historical_price_field: str = "close"
+    historical_chunk_days: int = 1825
+    historical_max_retries: int = 2
+    historical_retry_backoff_seconds: float = 0.5
+    historical_request_delay_seconds: float = 0.15
+    allow_usd_cable_history: bool = False
+    drop_zero_volume_rows: bool = True
 
     def __post_init__(self) -> None:
         t = _check_finite(self.timeout_seconds, "timeout_seconds")
@@ -1303,6 +1345,32 @@ class IOLConfig:
         if self.min_valid_rows < 1:
             raise ConfigurationError("'min_valid_rows' must be >= 1.")
 
+        bonos_url = _validate_https_url(self.bonos_url, "bonos_url")
+        ons_url = _validate_https_url(self.ons_url, "ons_url")
+        hist_url = _validate_https_url(self.historical_url, "historical_url")
+        def_mkt = str(self.default_market or "").strip().upper()
+        if not def_mkt:
+            raise ConfigurationError("'default_market' must be a non-empty market code.")
+        if self.historical_price_field not in VALID_IOL_HISTORICAL_PRICE_FIELDS:
+            raise ConfigurationError(
+                f"Invalid historical_price_field '{self.historical_price_field}'. "
+                f"Expected one of {VALID_IOL_HISTORICAL_PRICE_FIELDS}."
+            )
+        if not isinstance(self.historical_chunk_days, int) or isinstance(self.historical_chunk_days, bool) or self.historical_chunk_days < 1:
+            raise ConfigurationError("'historical_chunk_days' must be a positive integer.")
+        if not isinstance(self.historical_max_retries, int) or isinstance(self.historical_max_retries, bool) or self.historical_max_retries < 0:
+            raise ConfigurationError("'historical_max_retries' must be an integer >= 0.")
+        backoff = _check_finite(self.historical_retry_backoff_seconds, "historical_retry_backoff_seconds")
+        if backoff < 0.0:
+            raise ConfigurationError("'historical_retry_backoff_seconds' must be >= 0.")
+        delay = _check_finite(self.historical_request_delay_seconds, "historical_request_delay_seconds")
+        if delay < 0.0:
+            raise ConfigurationError("'historical_request_delay_seconds' must be >= 0.")
+
+        object.__setattr__(self, "bonos_url", bonos_url)
+        object.__setattr__(self, "ons_url", ons_url)
+        object.__setattr__(self, "historical_url", hist_url)
+        object.__setattr__(self, "default_market", def_mkt)
         object.__setattr__(self, "timeout_seconds", t)
         object.__setattr__(self, "max_mep_time_skew_seconds", skew)
         object.__setattr__(self, "max_mep_market_time_diff_seconds", mkt_diff)
@@ -1310,6 +1378,9 @@ class IOLConfig:
         object.__setattr__(self, "mep_plausible_max", m_max)
         object.__setattr__(self, "low_liquidity_amount_threshold", liq)
         object.__setattr__(self, "wide_spread_bps_threshold", sp)
+        object.__setattr__(self, "historical_retry_backoff_seconds", backoff)
+        object.__setattr__(self, "historical_request_delay_seconds", delay)
+        object.__setattr__(self, "drop_zero_volume_rows", bool(self.drop_zero_volume_rows))
 
     def to_dict(self) -> Dict[str, Any]:
         return _serialize_value(asdict(self))

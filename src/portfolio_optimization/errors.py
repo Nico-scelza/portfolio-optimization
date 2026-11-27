@@ -62,6 +62,11 @@ class IOLQuoteError(DataQualityError):
     default_phase = "iol_quotes"
 
 
+class IOLHistoryError(IOLQuoteError):
+    default_code = "iol_history_error"
+    default_phase = "iol_historical_prices"
+
+
 class FixedIncomeValidationError(PortfolioAnalysisError):
     default_code = "fixed_income_validation_error"
     default_phase = "fixed_income"

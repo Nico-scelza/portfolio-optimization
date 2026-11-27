@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,7 @@ from .errors import (
     FXConversionError,
     InfeasibleConstraintsError,
     InsufficientHistoryError,
+    IOLHistoryError,
     OptimizationConvergenceError,
 )
 from .expected_returns import compute_expected_returns_pipeline
@@ -36,11 +39,19 @@ from .fixed_income import (
     evaluate_fixed_income_instrument,
     normalize_execution_price_to_usd_per_unit,
 )
-from .iol import IOLPanelSnapshot, fetch_iol_quotes_for_instruments
+from .iol import (
+    _AR_TZ,
+    IOLHistoricalSeries,
+    IOLPanelSnapshot,
+    _parse_iol_market_timestamp,
+    fetch_iol_historical_prices_for_instruments,
+    fetch_iol_quotes_for_instruments,
+)
 from .market_data import (
     FXConversionDiagnostics,
     _download_prices,
     _normalize_datetime_index,
+    _resolve_cutoff_timestamp,
     calcular_cvar_historico,
     compute_weekly_returns_w_fri,
     fetch_vix_history,
@@ -1772,6 +1783,7 @@ class _TradablePriceResolution:
     series_type: str
     quote_unit: Optional[str]
     price_timestamp: Optional[str]
+    usd_settlement_type: Optional[str] = None
     blocked_reason: Optional[str] = None
     warnings: Tuple[str, ...] = field(default_factory=tuple)
 
@@ -1788,6 +1800,7 @@ def _resolve_tradable_market_price(
     weekly_cutoff_tz: str,
     as_of_cutoff: Optional[pd.Timestamp],
     as_of_date: Optional[Any] = None,
+    iol_historical_series: Optional[Dict[str, IOLHistoricalSeries]] = None,
 ) -> _TradablePriceResolution:
     """Resolve a single authoritative tradable market price shared by YTM, valuation, and rebalancing.
 
@@ -1803,6 +1816,8 @@ def _resolve_tradable_market_price(
          * When ``quote_source == "yfinance"`` and ``historical_price_series_type == "market_price"``,
            strictly requires ``unadjusted_closes[ticker]`` (``auto_adjust=False``) and NEVER
            falls back to ``auto_adjust=True``.
+         * When ``direct_price_sources[iid] == "iol_historical"``, strictly uses unadjusted
+           ``bars["close"]`` (``Cierre``) rather than ``adjusted_close``.
          * Risk proxies (``proxies_used``) are NEVER treated as tradable bond market prices.
        - For all other instruments (equities, ETFs, gold, crypto): uses sanitized historical
          USD series up to ``as_of_cutoff``.
@@ -1810,28 +1825,72 @@ def _resolve_tradable_market_price(
     iid = inst.instrument_id
     terms = inst.fixed_income_terms
     is_individual_debt = (inst.asset_subtype in INDIVIDUAL_DEBT_SUBTYPES) or (terms is not None)
+    resolution_warnings: List[str] = []
 
-    # 1. Valid IOL snapshot quote
+    # 1. Valid IOL snapshot quote (fail-closed exclusion if after or unverifiable against as_of_cutoff)
     if iid in iol_quotes:
         iq = iol_quotes[iid]
-        q_usd = float(iq.price_usd)
-        if terms is not None and terms.cashflow_currency != "USD":
-            q_terms = iq.price_original
-            ccy_terms = iq.original_currency
-        else:
-            q_terms = q_usd
-            ccy_terms = "USD"
-        return _TradablePriceResolution(
-            instrument_id=iid,
-            tradable=True,
-            quoted_price_usd=q_usd,
-            quoted_price_for_terms=q_terms,
-            quoted_currency_for_terms=ccy_terms,
-            source=iq.panel_source,
-            series_type="iol_snapshot",
-            quote_unit=iq.quote_unit,
-            price_timestamp=iq.market_timestamp or iq.observed_at,
-        )
+        iol_quote_after_cutoff = False
+        if as_of_cutoff is not None:
+            q_dt_utc: Optional[datetime] = None
+            used_ts_label: Optional[str] = None
+            for cand_ts in (iq.market_timestamp, iq.observed_at):
+                if not cand_ts:
+                    continue
+                try:
+                    parsed_dt = _parse_iol_market_timestamp(cand_ts)
+                except Exception:
+                    parsed_dt = None
+                if parsed_dt is not None:
+                    q_dt_utc = parsed_dt
+                    used_ts_label = str(cand_ts)
+                    break
+
+            if q_dt_utc is None:
+                iol_quote_after_cutoff = True
+                resolution_warnings.append(
+                    f"IOL live snapshot quote for '{iid}' lacks a parseable timestamp "
+                    f"(market_timestamp={iq.market_timestamp!r}, observed_at={iq.observed_at!r}) "
+                    "to verify causality against as_of_cutoff; excluded fail-closed to prevent look-ahead."
+                )
+            else:
+                q_ts_local = (
+                    pd.Timestamp(q_dt_utc)
+                    .tz_convert(ZoneInfo(weekly_cutoff_tz))
+                    .tz_localize(None)
+                    .as_unit("ns")
+                )
+                cut_ts, cut_date_only = _resolve_cutoff_timestamp(as_of_cutoff, target_tz=weekly_cutoff_tz)
+                if cut_date_only and cut_ts == cut_ts.normalize():
+                    cut_ts = (cut_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
+                if q_ts_local > cut_ts:
+                    iol_quote_after_cutoff = True
+                    resolution_warnings.append(
+                        f"IOL live snapshot quote for '{iid}' ({used_ts_label}) is strictly after as_of_cutoff "
+                        f"({cut_ts.isoformat()}); excluded to prevent look-ahead and falling through to historical market price <= as_of_cutoff."
+                    )
+
+        if not iol_quote_after_cutoff:
+            q_usd = float(iq.price_usd)
+            if terms is not None and terms.cashflow_currency != "USD":
+                q_terms = iq.price_original
+                ccy_terms = iq.original_currency
+            else:
+                q_terms = q_usd
+                ccy_terms = "USD"
+            return _TradablePriceResolution(
+                instrument_id=iid,
+                tradable=True,
+                quoted_price_usd=q_usd,
+                quoted_price_for_terms=q_terms,
+                quoted_currency_for_terms=ccy_terms,
+                source=iq.panel_source,
+                series_type="iol_snapshot",
+                quote_unit=iq.quote_unit,
+                price_timestamp=iq.market_timestamp or iq.observed_at,
+                usd_settlement_type=iq.usd_settlement_type,
+                warnings=tuple(resolution_warnings),
+            )
 
     # 2. Explicit manual_price_usd
     if inst.manual_price_usd is not None:
@@ -1852,6 +1911,7 @@ def _resolve_tradable_market_price(
             series_type="manual_price_usd",
             quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
             price_timestamp=ts_str,
+            warnings=tuple(resolution_warnings),
         )
 
     # 3. Direct historical series for individual debt (strict tradable market-price guards)
@@ -1930,6 +1990,31 @@ def _resolve_tradable_market_price(
                     ),
                 )
             series_type_lbl = "yfinance_unadjusted_close"
+        elif hist_src == "iol_historical":
+            hist_obj = (iol_historical_series or {}).get(iid)
+            if hist_obj is not None and not hist_obj.bars.empty and "close" in hist_obj.bars.columns:
+                candidate_series = hist_obj.bars["close"]
+            elif hist_obj is not None and hist_obj.price_field == "adjusted_close":
+                return _TradablePriceResolution(
+                    instrument_id=iid,
+                    tradable=False,
+                    quoted_price_usd=None,
+                    quoted_price_for_terms=None,
+                    quoted_currency_for_terms=None,
+                    source="iol_historical",
+                    series_type="missing_unadjusted_close",
+                    quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+                    price_timestamp=None,
+                    usd_settlement_type=hist_obj.usd_settlement_type,
+                    blocked_reason=(
+                        f"Unadjusted IOL market 'Cierre' column is unavailable for individual debt '{iid}' "
+                        "(historical_price_field='adjusted_close'); refusing to treat adjusted_close as tradable market price."
+                    ),
+                    warnings=tuple(resolution_warnings),
+                )
+            else:
+                candidate_series = prices_cols.get(iid)
+            series_type_lbl = "iol_historical_market_price"
         else:
             candidate_series = prices_cols.get(iid)
             series_type_lbl = "prices_usd_override_market_price"
@@ -1976,6 +2061,13 @@ def _resolve_tradable_market_price(
         px_val = float(san_debt.series.iloc[-1])
         px_ts = pd.Timestamp(san_debt.series.index[-1]).date().isoformat()
         terms_is_usd = terms is None or terms.cashflow_currency == "USD"
+        hist_obj = (iol_historical_series or {}).get(iid)
+        resolved_quote_unit = (
+            inst.quote_unit
+            or (terms.price_convention if terms is not None else None)
+            or (hist_obj.quote_unit if hist_obj is not None else None)
+            or ("per_100_original_nominal" if hist_src == "iol_historical" else None)
+        )
         return _TradablePriceResolution(
             instrument_id=iid,
             tradable=True,
@@ -1984,8 +2076,10 @@ def _resolve_tradable_market_price(
             quoted_currency_for_terms="USD" if terms_is_usd else None,
             source=hist_src,
             series_type=series_type_lbl,
-            quote_unit=inst.quote_unit or (terms.price_convention if terms is not None else None),
+            quote_unit=resolved_quote_unit,
             price_timestamp=px_ts,
+            usd_settlement_type=hist_obj.usd_settlement_type if hist_obj is not None else None,
+            warnings=tuple(resolution_warnings),
         )
 
     # 4. Non-individual-debt instruments (equities, ETFs, gold, crypto, etc.)
@@ -2038,6 +2132,8 @@ def analyze_portfolio(
     vix_history_override: Optional[pd.Series] = None,
     current_vix_override: Optional[Tuple[Optional[float], Optional[pd.Timestamp], bool]] = None,
     iol_snapshots_override: Optional[Dict[str, IOLPanelSnapshot]] = None,
+    iol_history_override: Optional[Dict[str, IOLHistoricalSeries]] = None,
+    iol_history_fetcher: Optional[Callable[..., IOLHistoricalSeries]] = None,
     market_caps_override: Optional[Dict[str, float]] = None,
     sector_map_override: Optional[Dict[str, str]] = None,
 ) -> AnalysisResult:
@@ -2065,8 +2161,56 @@ def analyze_portfolio(
     if cfg.as_of_date is not None:
         as_of_cutoff = (pd.Timestamp(cfg.as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).as_unit("ns")
 
+    override_df = prices_usd_override.copy() if prices_usd_override is not None else pd.DataFrame()
+    if not override_df.empty:
+        override_df.columns = [str(c).strip().upper() for c in override_df.columns]
+
+    # Avoid unnecessary future live IOL panel fetches during strictly historical as_of_date
+    # backtests when an IOL instrument already declares verified USD/USD_CABLE currency and has
+    # a historical source (also enabling backtests of matured bonds absent from today's live panel).
+    is_past_as_of_without_snapshot = (
+        iol_snapshots_override is None
+        and cfg.as_of_date is not None
+        and cfg.as_of_date < datetime.now(_AR_TZ).date()
+    )
+    iol_quote_instruments: List[InstrumentConfig] = []
+    for inst in instruments:
+        if inst.quote_source not in ("iol_bonos", "iol_ons"):
+            continue
+        has_override_hist = (
+            (not override_df.empty and (inst.instrument_id in override_df.columns or inst.ticker.upper() in override_df.columns))
+            or (
+                iol_history_override is not None
+                and any(
+                    k in iol_history_override
+                    for k in (inst.instrument_id, inst.iol_symbol or "", inst.ticker.strip().upper())
+                    if k
+                )
+            )
+        )
+        sp_map = inst.iol_species_map or {}
+        eff_sym = (inst.iol_symbol or inst.ticker).strip().upper()
+        has_unambiguous_usd_target = (
+            bool(sp_map and ("D" in sp_map or "C" in sp_map))
+            or (inst.currency == "USD" and len(eff_sym) >= 4 and eff_sym.endswith("D"))
+            or (inst.currency == "USD_CABLE" and len(eff_sym) >= 4 and eff_sym.endswith("C"))
+        )
+        can_skip_future_live_panel = (
+            is_past_as_of_without_snapshot
+            and has_unambiguous_usd_target
+            and (cfg.iol.fetch_historical_prices or has_override_hist)
+        )
+        if can_skip_future_live_panel:
+            warnings_list.append(
+                f"Skipped live IOL panel snapshot fetch for '{inst.instrument_id}' because as_of_date "
+                f"({cfg.as_of_date.isoformat()}) is strictly historical and USD species target is unambiguously "
+                "configured; using historical market price <= as_of_date without look-ahead."
+            )
+            continue
+        iol_quote_instruments.append(inst)
+
     iol_quotes: Dict[str, IOLQuoteResult] = fetch_iol_quotes_for_instruments(
-        instruments,
+        iol_quote_instruments,
         iol_config=cfg.iol,
         preloaded_snapshots=iol_snapshots_override,
     )
@@ -2078,13 +2222,10 @@ def analyze_portfolio(
     proxies_used: Dict[str, str] = {}
     missing_history_assets: List[str] = []
 
-    override_df = prices_usd_override.copy() if prices_usd_override is not None else pd.DataFrame()
-    if not override_df.empty:
-        override_df.columns = [str(c).strip().upper() for c in override_df.columns]
-
     yfinance_download_map: Dict[str, str] = {}
     yfinance_direct_ids: set[str] = set()
     currency_overrides: Dict[str, str] = {}
+    iol_history_instruments: List[InstrumentConfig] = []
 
     for inst in instruments:
         iid = inst.instrument_id
@@ -2103,20 +2244,59 @@ def analyze_portfolio(
             # AUD-01: ONLY forward explicit user-declared currency overrides (default is None = auto-detect)
             if inst.currency is not None:
                 currency_overrides[inst.ticker.upper()] = inst.currency
-        else:
-            if inst.historical_proxy_ticker and cfg.risk.allow_explicit_proxies:
-                proxy_tkr = inst.historical_proxy_ticker.strip().upper()
-                if not override_df.empty and proxy_tkr in override_df.columns:
-                    prices_cols[iid] = override_df[proxy_tkr]
-                else:
-                    yfinance_download_map[iid] = inst.historical_proxy_ticker
-                proxies_used[iid] = inst.historical_proxy_ticker
-                warnings_list.append(
-                    f"Instrument '{iid}' lacks direct historical USD prices; using user-approved explicit proxy "
-                    f"'{inst.historical_proxy_ticker}' for weekly risk estimation. Proxy tracking error is not captured."
-                )
+        elif inst.historical_proxy_ticker and cfg.risk.allow_explicit_proxies:
+            proxy_tkr = inst.historical_proxy_ticker.strip().upper()
+            if not override_df.empty and proxy_tkr in override_df.columns:
+                prices_cols[iid] = override_df[proxy_tkr]
             else:
+                yfinance_download_map[iid] = inst.historical_proxy_ticker
+            proxies_used[iid] = inst.historical_proxy_ticker
+            warnings_list.append(
+                f"Instrument '{iid}' lacks direct historical USD prices; using user-approved explicit proxy "
+                f"'{inst.historical_proxy_ticker}' for weekly risk estimation. Proxy tracking error is not captured."
+            )
+        elif inst.quote_source in ("iol_bonos", "iol_ons") and cfg.iol.fetch_historical_prices:
+            if inst.historical_price_series_type == "adjusted_total_return":
+                raise IOLHistoryError(
+                    f"Instrument '{iid}' requests historical_price_series_type='adjusted_total_return', "
+                    "but IOL DatosHistoricos provides unadjusted market close prices only (coupons and amortizations "
+                    "are not adjusted). Supply an external total-return series via prices_usd_override or set "
+                    "historical_price_series_type='market_price'.",
+                    asset_id=iid,
+                    code="iol_total_return_unavailable",
+                )
+            iol_history_instruments.append(inst)
+        else:
+            missing_history_assets.append(iid)
+
+    iol_historical_series: Dict[str, IOLHistoricalSeries] = {}
+    if iol_history_instruments:
+        iol_historical_series = fetch_iol_historical_prices_for_instruments(
+            iol_history_instruments,
+            iol_quotes=iol_quotes,
+            period=cfg.risk.period,
+            as_of_date=cfg.as_of_date,
+            iol_config=cfg.iol,
+            preloaded_history=iol_history_override,
+            history_fetcher=iol_history_fetcher,
+        )
+        for inst in iol_history_instruments:
+            iid = inst.instrument_id
+            hist = iol_historical_series.get(iid)
+            if hist is None or hist.price_series.empty:
                 missing_history_assets.append(iid)
+            else:
+                prices_cols[iid] = hist.price_series.rename(iid)
+                direct_price_sources[iid] = "iol_historical"
+                warnings_list.extend(hist.warnings)
+                if not hist.is_total_return and not any(
+                    "price return only" in w.lower() or "not total return" in w.lower()
+                    for w in hist.warnings
+                ):
+                    warnings_list.append(
+                        f"IOL historical series for '{iid}' ({hist.symbol}) represents unadjusted market prices "
+                        "(price return only, NOT total return; coupons and principal amortizations are not reinvested or adjusted by IOL)."
+                    )
 
     fx_diagnostics: Dict[str, FXConversionDiagnostics] = {}
     unadjusted_closes: Dict[str, pd.Series] = {}
@@ -2162,6 +2342,7 @@ def analyze_portfolio(
             weekly_cutoff_tz=cfg.risk.weekly_cutoff_tz,
             as_of_cutoff=as_of_cutoff,
             as_of_date=cfg.as_of_date,
+            iol_historical_series=iol_historical_series,
         )
         for inst in instruments
     }
@@ -2195,9 +2376,10 @@ def analyze_portfolio(
     if missing_history_assets:
         raise InsufficientHistoryError(
             f"Optimization blocked: instrument(s) {missing_history_assets} lack valid historical USD price series "
-            "(IOL quotes are point-in-time snapshots only; historical series are never fabricated from coupons or snapshots, "
-            "and instruments are never silently dropped). Supply historical total-return prices, or configure an explicit "
-            "proxy with risk.allow_explicit_proxies=True. Independent IOL quotes and fixed-income YTM calculations remain available.",
+            "(historical series are never fabricated from point-in-time quotes or coupon schedules, and instruments are "
+            "never silently dropped). Enable IOL historical retrieval (iol.fetch_historical_prices=True) for supported "
+            "IOL USD bonds/ONs, supply external historical USD prices, or configure an explicit proxy with "
+            "risk.allow_explicit_proxies=True. Independent IOL quotes and fixed-income YTM calculations remain available.",
             details={
                 "missing_history_assets": missing_history_assets,
                 "iol_quotes_available": list(iol_quotes.keys()),
@@ -2273,10 +2455,12 @@ def analyze_portfolio(
     for iid in ordered_ids:
         inst = inst_map[iid]
         px_res = resolved_tradable_prices[iid]
+        if px_res.warnings:
+            warnings_list.extend(px_res.warnings)
         if px_res.tradable and px_res.quoted_price_usd is not None:
             latest_prices_usd[iid] = float(px_res.quoted_price_usd)
-            if iid in iol_quotes:
-                quote_units_by_id[iid] = iol_quotes[iid].quote_unit
+            if px_res.quote_unit is not None:
+                quote_units_by_id[iid] = px_res.quote_unit
             unit_px, unit_meta = normalize_execution_price_to_usd_per_unit(
                 inst,
                 latest_prices_usd[iid],
@@ -2290,7 +2474,8 @@ def analyze_portfolio(
                 "tradable": True,
                 "source": px_res.source,
                 "series_type": px_res.series_type,
-                "currency": "USD",
+                "currency": "USD_CABLE" if px_res.usd_settlement_type == "USD_CABLE_C" else "USD",
+                "usd_settlement_type": px_res.usd_settlement_type,
                 "quoted_price_usd": latest_prices_usd[iid],
                 "execution_price_usd_per_unit": execution_prices_usd_per_unit[iid],
                 "quote_unit": unit_meta.get("quote_unit"),
@@ -2308,6 +2493,7 @@ def analyze_portfolio(
                 "source": px_res.source,
                 "series_type": px_res.series_type,
                 "currency": None,
+                "usd_settlement_type": px_res.usd_settlement_type,
                 "quoted_price_usd": None,
                 "execution_price_usd_per_unit": None,
                 "quote_unit": px_res.quote_unit,
@@ -2476,6 +2662,7 @@ def analyze_portfolio(
 
     quotes_and_dq = {
         "iol_quotes": {k: v.to_dict() for k, v in iol_quotes.items()},
+        "iol_historical_metadata": {k: v.to_metadata_dict() for k, v in iol_historical_series.items()},
         "latest_prices_usd": latest_prices_usd,
         "execution_prices_usd_per_unit": execution_prices_usd_per_unit,
         "price_unit_metadata": price_unit_metadata,
