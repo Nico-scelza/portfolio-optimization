@@ -540,14 +540,20 @@ def compute_expected_returns_pipeline(
             extra_warnings.extend(dcf_res.warnings)
             views_total[iid] = (dcf_res.annualized_expected_return, dcf_res.confidence)
             view_labels[iid] = f"Annualized DCF ({dcf_res.horizon_years:g}y {dcf_res.valuation_basis})"
-        elif (
-            cfg.fixed_income_bl_view_mode == "explicit_ytm_view"
-            and iid in fi_map
-            and fi_map[iid].status == "ok"
-            and fi_map[iid].ytm_annual is not None
-        ):
+        elif cfg.fixed_income_bl_view_mode == "explicit_ytm_view" and iid in fi_map:
             fi_m = fi_map[iid]
-            if fi_m.cashflow_currency == "USD":
+            valid_ytm = (
+                fi_m.status == "ok"
+                and fi_m.ytm_annual is not None
+                and math.isfinite(float(fi_m.ytm_annual))
+                and float(fi_m.ytm_annual) > -1.0
+            )
+            if not valid_ytm:
+                extra_warnings.append(
+                    f"Automatic YTM for '{iid}' is unavailable/invalid (status='{fi_m.status}', reason={fi_m.reason!r}); "
+                    "excluded from Black-Litterman expected-return views (no invalid or synthetic YTM used)."
+                )
+            elif fi_m.cashflow_currency == "USD":
                 views_total[iid] = (float(fi_m.ytm_annual), float(cfg.fixed_income_view_confidence))
                 view_labels[iid] = "Explicit fixed-income contractual YTM view (hold-to-maturity/reinvestment hypothesis)"
                 extra_warnings.append(
@@ -558,7 +564,7 @@ def compute_expected_returns_pipeline(
                     f"Fixed-income YTM for '{iid}' is in {fi_m.cashflow_currency} (not USD); kept as standalone metric rather than USD BL view."
                 )
 
-    return compute_black_litterman(
+    bl_res = compute_black_litterman(
         cov_matrix=cov_matrix,
         reference_weights=ref_weights,
         rf_rate=rf_rate,
@@ -570,3 +576,10 @@ def compute_expected_returns_pipeline(
         view_source_labels=view_labels,
         prior_warnings=extra_warnings,
     )
+    bl_res.diagnostics["fixed_income_bl_view_mode"] = cfg.fixed_income_bl_view_mode
+    bl_res.diagnostics["fixed_income_ytm_annual"] = {
+        k: float(v.ytm_annual)
+        for k, v in fi_map.items()
+        if v.status == "ok" and v.ytm_annual is not None and math.isfinite(float(v.ytm_annual))
+    }
+    return bl_res

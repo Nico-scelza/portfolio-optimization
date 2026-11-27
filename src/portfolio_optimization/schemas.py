@@ -73,7 +73,7 @@ VALID_PRICE_CONVENTIONS = (
 )
 VALID_PRICE_TYPES = ("dirty", "clean")
 VALID_COUPON_STRUCTURES = ("fixed", "zero_coupon", "step_up", "floating", "indexed")
-VALID_DAY_COUNTS = ("30/360", "ACT/365", "ACT/360", "ACT/ACT")
+VALID_DAY_COUNTS = ("30/360", "ACT/365", "ACT/365F", "ACT/360", "ACT/ACT")
 VALID_FEE_STRUCTURES = ("percentage", "fixed", "fixed_plus_percentage")
 VALID_COV_ESTIMATORS = ("vix_regime", "static_shrinkage", "ewma")
 VALID_SHRINKAGE_METHODS = ("ledoit_wolf", "oas", "sample")
@@ -278,6 +278,9 @@ class BrokerConfig:
 class CashFlowEvent:
     """Explicit contractual payment event for an individual bond / ON / T-bill.
 
+    Both historical and future cashflows may be supplied in the same schedule;
+    the engine splits them automatically against the valuation / ``as_of`` date
+    using ``ex_date`` when provided (falling back to ``payment_date``).
     Amounts are expressed per ``reference_nominal`` in ``cashflow_currency``.
     If ``coupon_rate`` is supplied instead of ``coupon_amount``, explicit
     ``day_count_convention``, ``coupon_frequency``, and ``period_start_date``
@@ -289,10 +292,19 @@ class CashFlowEvent:
     amortization_amount: float = 0.0
     coupon_rate: Optional[float] = None
     period_start_date: Optional[date] = None
+    ex_date: Optional[date] = None
 
     def __post_init__(self) -> None:
         pdate = _parse_date(self.payment_date, "payment_date")
         object.__setattr__(self, "payment_date", pdate)
+
+        if self.ex_date is not None:
+            ex_dt = _parse_date(self.ex_date, "ex_date")
+            if ex_dt > pdate:
+                raise FixedIncomeValidationError(
+                    f"CashFlowEvent ex_date ({ex_dt}) cannot be after payment_date ({pdate})."
+                )
+            object.__setattr__(self, "ex_date", ex_dt)
 
         if self.period_start_date is not None:
             sdate = _parse_date(self.period_start_date, "period_start_date")
@@ -324,6 +336,11 @@ class CashFlowEvent:
                 "Provide either monetary 'coupon_amount' or 'coupon_rate', not both, to avoid ambiguity."
             )
 
+    @property
+    def effective_detachment_date(self) -> date:
+        """Economic detachment date (``ex_date`` when provided, otherwise ``payment_date``)."""
+        return self.ex_date if self.ex_date is not None else self.payment_date
+
     def to_dict(self) -> Dict[str, Any]:
         return _serialize_value(asdict(self))
 
@@ -337,12 +354,16 @@ class FixedIncomeTerms:
     """Manual contractual specification for an individual bond, ON, or T-bill.
 
     Manual cashflows are the source of truth; published yields never override them.
+    Historical and future cashflows may share ``cashflows``; set
+    ``historical_cashflows_confirmed=True`` (and optionally ``issue_date``,
+    ``historical_cashflow_start_date``, ``historical_cashflow_end_date``) to
+    confirm historical coverage explicitly (including confirmed payment-free periods).
     """
 
     cashflow_currency: str
     reference_nominal: float
     maturity_date: date
-    settlement_date: date
+    settlement_date: Optional[date] = None
     cashflows: Tuple[CashFlowEvent, ...] = field(default_factory=tuple)
     residual_nominal: Optional[float] = None
     amortization_factor: Optional[float] = None
@@ -355,6 +376,11 @@ class FixedIncomeTerms:
     coupon_frequency: Optional[int] = None
     index_assumptions: Optional[Dict[str, Any]] = None
     cashflow_fx_to_usd: Optional[float] = None
+    issue_date: Optional[date] = None
+    historical_cashflows_confirmed: bool = False
+    historical_cashflow_start_date: Optional[date] = None
+    historical_cashflow_end_date: Optional[date] = None
+    historical_price_type: Optional[str] = None
 
     def __post_init__(self) -> None:
         ccy = str(self.cashflow_currency or "").strip().upper()
@@ -368,43 +394,60 @@ class FixedIncomeTerms:
         object.__setattr__(self, "reference_nominal", ref_nom)
 
         mat_date = _parse_date(self.maturity_date, "maturity_date")
-        settle_date = _parse_date(self.settlement_date, "settlement_date")
-        if settle_date > mat_date:
-            raise FixedIncomeValidationError(
-                f"settlement_date ({settle_date}) cannot be after maturity_date ({mat_date})."
-            )
         object.__setattr__(self, "maturity_date", mat_date)
+
+        settle_date: Optional[date] = None
+        if self.settlement_date is not None:
+            settle_date = _parse_date(self.settlement_date, "settlement_date")
+            if settle_date > mat_date:
+                raise FixedIncomeValidationError(
+                    f"settlement_date ({settle_date}) cannot be after maturity_date ({mat_date})."
+                )
         object.__setattr__(self, "settlement_date", settle_date)
 
-        # Resolve residual_nominal and amortization_factor consistently
-        res_nom = self.residual_nominal
-        amort_fac = self.amortization_factor
-        if res_nom is None and amort_fac is None:
-            res_nom = ref_nom
-            amort_fac = 1.0
-        elif res_nom is not None and amort_fac is None:
-            res_nom = _check_finite(res_nom, "residual_nominal")
-            amort_fac = res_nom / ref_nom
-        elif res_nom is None and amort_fac is not None:
-            amort_fac = _check_finite(amort_fac, "amortization_factor")
-            res_nom = ref_nom * amort_fac
-        else:
-            res_nom = _check_finite(res_nom, "residual_nominal")
-            amort_fac = _check_finite(amort_fac, "amortization_factor")
-            if not math.isclose(res_nom, ref_nom * amort_fac, rel_tol=1e-4, abs_tol=1e-6):
+        iss_date: Optional[date] = None
+        if self.issue_date is not None:
+            iss_date = _parse_date(self.issue_date, "issue_date")
+            if iss_date > mat_date:
                 raise FixedIncomeValidationError(
-                    f"Inconsistent residual_nominal ({res_nom}) vs reference_nominal * amortization_factor ({ref_nom * amort_fac})."
+                    f"issue_date ({iss_date}) cannot be after maturity_date ({mat_date})."
                 )
-        if res_nom <= 0.0 or res_nom > ref_nom * (1.0 + 1e-9):
+            if settle_date is not None and iss_date > settle_date:
+                raise FixedIncomeValidationError(
+                    f"issue_date ({iss_date}) cannot be after settlement_date ({settle_date})."
+                )
+        object.__setattr__(self, "issue_date", iss_date)
+
+        hist_confirmed = bool(self.historical_cashflows_confirmed)
+        object.__setattr__(self, "historical_cashflows_confirmed", hist_confirmed)
+
+        h_start: Optional[date] = None
+        if self.historical_cashflow_start_date is not None:
+            h_start = _parse_date(self.historical_cashflow_start_date, "historical_cashflow_start_date")
+            if h_start > mat_date:
+                raise FixedIncomeValidationError(
+                    f"historical_cashflow_start_date ({h_start}) cannot be after maturity_date ({mat_date})."
+                )
+            if iss_date is not None and h_start < iss_date:
+                raise FixedIncomeValidationError(
+                    f"historical_cashflow_start_date ({h_start}) cannot precede issue_date ({iss_date})."
+                )
+        object.__setattr__(self, "historical_cashflow_start_date", h_start)
+
+        h_end: Optional[date] = None
+        if self.historical_cashflow_end_date is not None:
+            h_end = _parse_date(self.historical_cashflow_end_date, "historical_cashflow_end_date")
+            if h_start is not None and h_start > h_end:
+                raise FixedIncomeValidationError(
+                    f"historical_cashflow_start_date ({h_start}) cannot be after historical_cashflow_end_date ({h_end})."
+                )
+        object.__setattr__(self, "historical_cashflow_end_date", h_end)
+
+        if (h_start is not None or h_end is not None) and not hist_confirmed:
             raise FixedIncomeValidationError(
-                f"residual_nominal ({res_nom}) must satisfy 0 < residual_nominal <= reference_nominal ({ref_nom})."
+                "Setting 'historical_cashflow_start_date' or 'historical_cashflow_end_date' requires "
+                "'historical_cashflows_confirmed=True'."
             )
-        if amort_fac <= 0.0 or amort_fac > 1.0 + 1e-9:
-            raise FixedIncomeValidationError(
-                f"amortization_factor ({amort_fac}) must satisfy 0 < amortization_factor <= 1."
-            )
-        object.__setattr__(self, "residual_nominal", float(res_nom))
-        object.__setattr__(self, "amortization_factor", float(amort_fac))
 
         if self.price_convention not in VALID_PRICE_CONVENTIONS:
             raise FixedIncomeValidationError(
@@ -413,6 +456,10 @@ class FixedIncomeTerms:
         if self.price_type not in VALID_PRICE_TYPES:
             raise FixedIncomeValidationError(
                 f"Invalid price_type '{self.price_type}'. Expected one of {VALID_PRICE_TYPES}."
+            )
+        if self.historical_price_type is not None and self.historical_price_type not in VALID_PRICE_TYPES:
+            raise FixedIncomeValidationError(
+                f"Invalid historical_price_type '{self.historical_price_type}'. Expected one of {VALID_PRICE_TYPES}."
             )
         if self.coupon_structure not in VALID_COUPON_STRUCTURES:
             raise FixedIncomeValidationError(
@@ -448,6 +495,46 @@ class FixedIncomeTerms:
             for cf in self.cashflows
         )
         object.__setattr__(self, "cashflows", normalized_cfs)
+
+        # Resolve residual_nominal and amortization_factor consistently
+        res_nom = self.residual_nominal
+        amort_fac = self.amortization_factor
+        if res_nom is None and amort_fac is None:
+            if settle_date is not None:
+                tol = max(1e-4 * ref_nom, 1e-6)
+                total_all_amorts = sum(ev.amortization_amount for ev in normalized_cfs)
+                past_amorts = sum(
+                    ev.amortization_amount for ev in normalized_cfs if ev.effective_detachment_date <= settle_date
+                )
+                if past_amorts > 0.0 and math.isclose(total_all_amorts, ref_nom, abs_tol=tol) and (ref_nom - past_amorts) > tol:
+                    res_nom = ref_nom - past_amorts
+                    amort_fac = res_nom / ref_nom
+                else:
+                    res_nom = ref_nom
+                    amort_fac = 1.0
+        elif res_nom is not None and amort_fac is None:
+            res_nom = _check_finite(res_nom, "residual_nominal")
+            amort_fac = res_nom / ref_nom
+        elif res_nom is None and amort_fac is not None:
+            amort_fac = _check_finite(amort_fac, "amortization_factor")
+            res_nom = ref_nom * amort_fac
+        else:
+            res_nom = _check_finite(res_nom, "residual_nominal")
+            amort_fac = _check_finite(amort_fac, "amortization_factor")
+            if not math.isclose(res_nom, ref_nom * amort_fac, rel_tol=1e-4, abs_tol=1e-6):
+                raise FixedIncomeValidationError(
+                    f"Inconsistent residual_nominal ({res_nom}) vs reference_nominal * amortization_factor ({ref_nom * amort_fac})."
+                )
+        if res_nom is not None and (res_nom <= 0.0 or res_nom > ref_nom * (1.0 + 1e-9)):
+            raise FixedIncomeValidationError(
+                f"residual_nominal ({res_nom}) must satisfy 0 < residual_nominal <= reference_nominal ({ref_nom})."
+            )
+        if amort_fac is not None and (amort_fac <= 0.0 or amort_fac > 1.0 + 1e-9):
+            raise FixedIncomeValidationError(
+                f"amortization_factor ({amort_fac}) must satisfy 0 < amortization_factor <= 1."
+            )
+        object.__setattr__(self, "residual_nominal", None if res_nom is None else float(res_nom))
+        object.__setattr__(self, "amortization_factor", None if amort_fac is None else float(amort_fac))
 
     def to_dict(self) -> Dict[str, Any]:
         return _serialize_value(asdict(self))
@@ -1656,6 +1743,12 @@ class FixedIncomeMetricsResult:
     root_count_detected: int = 0
     warnings: List[str] = field(default_factory=list)
     reason: Optional[str] = None
+    ytm_weekly_effective: Optional[float] = None
+    historical_return_method: Optional[str] = None
+    historical_cashflow_coverage: Optional[str] = None
+    historical_cashflows_applied_count: int = 0
+    historical_coupons_applied: float = 0.0
+    historical_amortizations_applied: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return _serialize_value(asdict(self))

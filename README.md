@@ -88,9 +88,50 @@ Public Argentine sovereign bonds and corporate bonds (ONs) on InvertirOnline exp
 ### Price Field Selection, Price Return vs. Total Return & Currency Policy
 
 - **Selected field (`"close"` / `Cierre`)**: Empirical inspection on live IOL fixed-income histories (`AEC3D`, `BPA8D`, `AL30D`, `AL30`, `AL30C`, `YMCHD`) confirmed that `Cierre ajustado` is identical to unadjusted market `Cierre` across coupon payments and principal amortizations (for example, `AL30D`'s January 2025 amortization/coupon ex-date drop from `76.95` to `68.60` appears identically in both columns). The provider therefore selects unadjusted `Cierre` by default, audits `adjusted_close` differences in `quotes_and_data_quality["iol_historical_metadata"]`, always uses unadjusted `Cierre` (never `adjusted_close`) as the tradable market price for contractual YTM/valuation/rebalancing, and tags every IOL fixed-income series as `series_type="market_price"` and `is_total_return=False`.
-- **Total-return limitation**: Weekly returns computed from IOL fixed-income prices are **price returns only** (coupons and principal amortizations are not reinvested or adjusted by IOL). Requesting `historical_price_series_type="adjusted_total_return"` from IOL raises `IOLHistoryError(code="iol_total_return_unavailable")`. The project's existing return methodology is preserved unchanged; users who have verified historical paid cashflows can construct a total-return wealth index externally via `build_fixed_income_total_return_index` and supply it via `prices_usd_override`.
+- **Total-return limitation & manual cashflow integration**: IOL fixed-income prices alone are **price returns only** (coupons and principal amortizations are not adjusted by IOL). When the user supplies manual cashflows on `InstrumentConfig.fixed_income_terms` (`FixedIncomeTerms` with `CashFlowEvent`s) and explicitly sets `historical_cashflows_confirmed=True` (optionally bounded by `historical_cashflow_start_date` / `historical_cashflow_end_date`), the engine integrates IOL unadjusted `Cierre` with those confirmed historical cashflows—preserving nominal/residual and clean/dirty conventions—to produce Total Return before `W-FRI` aggregation and replaces the Price Return warning with Total Return diagnostics. Unconfirmed or partial coverage preserves Price Return on unconfirmed intervals with explicit warnings, and requesting `historical_price_series_type="adjusted_total_return"` without complete confirmed Total Return (or external `prices_usd_override`) raises `IOLHistoryError(code="iol_total_return_unavailable")`.
 - **Currency & species comparability**: Only verified local USD (`USD_LOCAL_D`) series enter the USD portfolio by default. USD Cable (`USD_CABLE_C`) is blocked unless explicitly opted in via `IOLConfig(allow_usd_cable_history=True)` (with warning and explicit settlement metadata), and ARS-only bonds/ONs (`USD_MEP_IMPLIED`) are always blocked rather than converted with spot `AL30/AL30D` MEP or official `ARS=X` FX.
 - **Operational controls**: HTTPS-only configurable endpoint URL validation (no embedded credentials, no insecure HTTP redirect downgrades), strict TLS (`verify=True`), explicit request timeouts, bounded retries with capped exponential backoff on transient network/HTTP errors (`429`/`5xx`, honoring numeric and HTTP-date `Retry-After`), immediate fail-closed errors on `401`/`403`, non-existent symbols, schema changes, negative/corrupted price cells, and conflicting duplicate closes, polite inter-request pacing, zero-price and zero-volume server-forward-filled no-trade row filtering (`drop_zero_volume_rows=True`) without forward-filling, leading and trailing partial-coverage detection, fail-closed `as_of_cutoff` snapshot filtering, and intraday/future bar exclusion prior to BCBA close (`17:00 ART`).
+
+## Manual Fixed-Income Cashflows, Total Return & Automatic YTM (TIR)
+
+Individual bonds and corporate obligations (`sovereign_bond`, `corporate_bond_on`, `tbill`) accept a single manual contractual schedule in `InstrumentConfig.fixed_income_terms` (`FixedIncomeTerms` + `CashFlowEvent`), used for both **historical Total Return** and **automatic YTM (TIR)**—never fetched from external cashflow APIs and never requiring manual TIR input:
+
+- **Cashflow schedule (`CashFlowEvent`)**: Supply `payment_date`, `coupon_amount` (or `coupon_rate` with `period_start_date` / `coupon_frequency` and `day_count_convention`), `amortization_amount`, and optional `ex_date` (economic detachment date). Historical and future cashflows may share the same `cashflows` tuple; the engine splits them automatically at `settlement_date` (or `as_of_date` / quote date when `settlement_date=None`) using `ex_date` when available (else `payment_date`), preventing double counting on boundary dates.
+- **Historical Total Return & confirmed zero-payment periods**: Absence of historical cashflow records does **not** imply zero payments. Set `historical_cashflows_confirmed=True` (and optionally `issue_date`, `historical_cashflow_start_date`, `historical_cashflow_end_date`) to confirm full or partial coverage—including payment-free intervals. Returns `R_t = (P_t + C_t + A_t) / P_{t-1} - 1` normalize quotes to consistent monetary, original/residual nominal (`per_100_original_nominal`, `per_100_residual_nominal`, `per_unit`), and dirty/clean bases (`price_type`, `historical_price_type`), assign each payment once via `ex_date` (or `payment_date` with an explicit timing-limitation note), preserve holiday/no-trade gaps without forward-fill, and enter `W-FRI` weekly aggregation via a base-100 wealth index.
+- **Automatic YTM (TIR)**: Solved automatically from the tradable market price `P_0` (dirty, adding `accrued_interest` only when `price_type="clean"`) and future contractual cashflows via XIRR (`0 = -P_0 + sum(CF_i / (1 + y)^t_i)`, effective annual rate using `day_count_convention`, default `ACT/365` / `ACT/365F`), exposed in `AnalysisResult.fixed_income_metrics[id].ytm_annual` (plus `ytm_weekly_effective = (1 + ytm_annual)^(1/52) - 1`). Invalid/incomplete schedules or missing/no-root prices never produce synthetic rates or enter Black-Litterman (`fixed_income_bl_view_mode="explicit_ytm_view"` opts USD contractual YTM into BL with explicit hold-to-maturity caveats).
+
+```python
+from datetime import date
+import portfolio_optimization as po
+
+al30d = po.InstrumentConfig(
+    instrument_id="AL30D",
+    ticker="AL30D",
+    section="fixed_income",
+    asset_subtype="sovereign_bond",
+    quote_source="iol_bonos",
+    currency="USD",
+    fixed_income_terms=po.FixedIncomeTerms(
+        cashflow_currency="USD",
+        reference_nominal=100.0,
+        maturity_date=date(2030, 7, 9),
+        # Optional when settlement_date=None: inferred from as_of_date / quote date;
+        # residual_nominal is inferred if all amortizations from issuance reconcile with reference_nominal,
+        # otherwise provide residual_nominal=... or amortization_factor=... explicitly.
+        price_convention="per_100_original_nominal",
+        price_type="dirty",
+        day_count_convention="ACT/365",
+        historical_cashflows_confirmed=True,
+        historical_cashflow_start_date=date(2024, 1, 1),
+        cashflows=(
+            # Historical and future cashflows in one schedule (per 100 original VN):
+            po.CashFlowEvent(payment_date=date(2024, 7, 9), ex_date=date(2024, 7, 5), coupon_amount=0.375, amortization_amount=4.0),
+            po.CashFlowEvent(payment_date=date(2025, 1, 9), ex_date=date(2025, 1, 7), coupon_amount=0.36, amortization_amount=8.0),
+            # ... remaining semi-annual coupon + amortization events through 2030-07-09
+        ),
+    ),
+)
+```
 
 ## Known Data Limitations
 
