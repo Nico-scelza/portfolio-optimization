@@ -379,4 +379,5 @@ def test_fixed_income_validation_floating_and_no_fabricated_history():
             cfg_no_hist,
             prices_usd_override=spy_prices,
             iol_snapshots_override={"iol_bonos": bonos},
+            iol_history_override={},
         )
