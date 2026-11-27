@@ -13,8 +13,8 @@ Key invariants:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from zoneinfo import ZoneInfo
 
@@ -36,8 +36,11 @@ from .errors import (
 )
 from .expected_returns import compute_expected_returns_pipeline
 from .fixed_income import (
+    FixedIncomeTotalReturnResult,
+    build_fixed_income_historical_return_series,
     evaluate_fixed_income_instrument,
     normalize_execution_price_to_usd_per_unit,
+    resolve_fixed_income_terms_for_valuation,
 )
 from .iol import (
     _AR_TZ,
@@ -1898,7 +1901,7 @@ def _resolve_tradable_market_price(
         terms_is_usd = terms is None or terms.cashflow_currency == "USD"
         ts_str = (
             terms.settlement_date.isoformat()
-            if terms is not None
+            if (terms is not None and terms.settlement_date is not None)
             else (as_of_date.isoformat() if as_of_date is not None else None)
         )
         return _TradablePriceResolution(
@@ -1952,7 +1955,15 @@ def _resolve_tradable_market_price(
             )
 
         hist_src = direct_price_sources[iid]
-        if inst.historical_price_series_type == "adjusted_total_return":
+        hist_obj_check = (iol_historical_series or {}).get(iid) if hist_src == "iol_historical" else None
+        iol_has_unadjusted_close = (
+            hist_src == "iol_historical"
+            and hist_obj_check is not None
+            and not hist_obj_check.bars.empty
+            and "close" in hist_obj_check.bars.columns
+            and hist_obj_check.price_field == "close"
+        )
+        if inst.historical_price_series_type == "adjusted_total_return" and not iol_has_unadjusted_close:
             return _TradablePriceResolution(
                 instrument_id=iid,
                 tradable=False,
@@ -2125,6 +2136,35 @@ def _resolve_tradable_market_price(
     )
 
 
+def _is_iol_price_return_warning(msg: str) -> bool:
+    low = msg.lower()
+    return ("price return only" in low and "not total return" in low) or (
+        "treat as market price return only" in low
+    )
+
+
+def _resolve_valuation_date_for_instrument(
+    as_of_date: Optional[date],
+    price_timestamp: Optional[str],
+) -> date:
+    if as_of_date is not None:
+        return as_of_date
+    if price_timestamp:
+        ts_str = str(price_timestamp).strip()
+        try:
+            parsed_dt = _parse_iol_market_timestamp(ts_str)
+            if parsed_dt is not None:
+                return parsed_dt.astimezone(_AR_TZ).date()
+        except Exception:
+            pass
+        if len(ts_str) >= 10:
+            try:
+                return date.fromisoformat(ts_str[:10])
+            except ValueError:
+                pass
+    return datetime.now(_AR_TZ).date()
+
+
 def analyze_portfolio(
     config: Union[PortfolioAnalysisConfig, Dict[str, Any]],
     *,
@@ -2256,12 +2296,14 @@ def analyze_portfolio(
                 f"'{inst.historical_proxy_ticker}' for weekly risk estimation. Proxy tracking error is not captured."
             )
         elif inst.quote_source in ("iol_bonos", "iol_ons") and cfg.iol.fetch_historical_prices:
-            if inst.historical_price_series_type == "adjusted_total_return":
+            if inst.historical_price_series_type == "adjusted_total_return" and (
+                inst.fixed_income_terms is None or not inst.fixed_income_terms.historical_cashflows_confirmed
+            ):
                 raise IOLHistoryError(
                     f"Instrument '{iid}' requests historical_price_series_type='adjusted_total_return', "
-                    "but IOL DatosHistoricos provides unadjusted market close prices only (coupons and amortizations "
-                    "are not adjusted). Supply an external total-return series via prices_usd_override or set "
-                    "historical_price_series_type='market_price'.",
+                    "but IOL DatosHistoricos provides unadjusted market close prices only without confirmed manual "
+                    "historical cashflows on FixedIncomeTerms. Confirm historical cashflows on FixedIncomeTerms, "
+                    "supply an external total-return series via prices_usd_override, or set historical_price_series_type='market_price'.",
                     asset_id=iid,
                     code="iol_total_return_unavailable",
                 )
@@ -2288,15 +2330,6 @@ def analyze_portfolio(
             else:
                 prices_cols[iid] = hist.price_series.rename(iid)
                 direct_price_sources[iid] = "iol_historical"
-                warnings_list.extend(hist.warnings)
-                if not hist.is_total_return and not any(
-                    "price return only" in w.lower() or "not total return" in w.lower()
-                    for w in hist.warnings
-                ):
-                    warnings_list.append(
-                        f"IOL historical series for '{iid}' ({hist.symbol}) represents unadjusted market prices "
-                        "(price return only, NOT total return; coupons and principal amortizations are not reinvested or adjusted by IOL)."
-                    )
 
     fx_diagnostics: Dict[str, FXConversionDiagnostics] = {}
     unadjusted_closes: Dict[str, pd.Series] = {}
@@ -2328,8 +2361,8 @@ def analyze_portfolio(
                     direct_price_sources[iid] = "yfinance"
 
     # NEW-01 & AUD-09: Resolve authoritative tradable market prices ONCE per instrument BEFORE
-    # fixed_income_metrics and BEFORE InsufficientHistoryError, and reuse the exact same resolution
-    # across fixed_income_metrics, latest_prices_usd, execution_prices_usd_per_unit, and rebalancing.
+    # Total Return adjustment, fixed_income_metrics, and InsufficientHistoryError, so YTM and
+    # rebalancing always receive real unadjusted market prices while risk models receive Total Return.
     resolved_tradable_prices: Dict[str, _TradablePriceResolution] = {
         inst.instrument_id: _resolve_tradable_market_price(
             inst,
@@ -2347,12 +2380,143 @@ def analyze_portfolio(
         for inst in instruments
     }
 
+    effective_inst_map: Dict[str, InstrumentConfig] = dict(inst_map)
+    effective_val_dates: Dict[str, date] = {}
+    for inst in cfg.fixed_income:
+        iid = inst.instrument_id
+        px_res = resolved_tradable_prices[iid]
+        val_date = _resolve_valuation_date_for_instrument(cfg.as_of_date, px_res.price_timestamp)
+        effective_val_dates[iid] = val_date
+        if inst.fixed_income_terms is not None:
+            if (
+                cfg.as_of_date is not None
+                and inst.fixed_income_terms.settlement_date is not None
+                and abs((inst.fixed_income_terms.settlement_date - cfg.as_of_date).days) > 4
+            ):
+                warnings_list.append(
+                    f"Instrument '{iid}' FixedIncomeTerms.settlement_date "
+                    f"({inst.fixed_income_terms.settlement_date.isoformat()}) differs from as_of_date "
+                    f"({cfg.as_of_date.isoformat()}) by >4 days."
+                )
+            eff_terms = resolve_fixed_income_terms_for_valuation(
+                inst.fixed_income_terms,
+                valuation_date=val_date,
+                asset_id=iid,
+            )
+            if eff_terms is not inst.fixed_income_terms:
+                effective_inst_map[iid] = replace(inst, fixed_income_terms=eff_terms)
+
+    # Integrate manual historical cashflows with IOL (or unadjusted market) price series BEFORE W-FRI aggregation
+    fixed_income_tr_results: Dict[str, FixedIncomeTotalReturnResult] = {}
+    fixed_income_return_diagnostics: Dict[str, Dict[str, Any]] = {}
+    for inst in cfg.fixed_income:
+        iid = inst.instrument_id
+        eff_inst = effective_inst_map[iid]
+        eff_terms = eff_inst.fixed_income_terms
+        if iid not in direct_price_sources:
+            continue
+        hist_src = direct_price_sources[iid]
+        if inst.asset_subtype not in INDIVIDUAL_DEBT_SUBTYPES and eff_terms is None:
+            continue
+
+        if hist_src == "iol_historical":
+            hist = iol_historical_series[iid]
+            tr_res = build_fixed_income_historical_return_series(
+                iid,
+                hist.price_series,
+                eff_terms,
+                price_source="iol_historical",
+                quote_unit=hist.quote_unit,
+                as_of_date=cfg.as_of_date,
+                duplicate_date_policy=cfg.risk.duplicate_date_policy,
+                target_tz=cfg.risk.weekly_cutoff_tz,
+                adjusted_close_differs_count=hist.adjusted_close_differs_count,
+                price_field=hist.price_field,
+            )
+            if inst.historical_price_series_type == "adjusted_total_return" and not tr_res.is_total_return:
+                raise IOLHistoryError(
+                    f"Instrument '{iid}' requests historical_price_series_type='adjusted_total_return', "
+                    f"but complete Total Return could not be constructed ({tr_res.coverage_status}): "
+                    + " ".join(tr_res.warnings),
+                    asset_id=iid,
+                    code="iol_total_return_unavailable",
+                )
+            fixed_income_tr_results[iid] = tr_res
+            fixed_income_return_diagnostics[iid] = tr_res.diagnostics
+            if tr_res.is_total_return or tr_res.coverage_status == "partial":
+                prices_cols[iid] = tr_res.series.rename(iid)
+                kept_warns = [w for w in hist.warnings if not _is_iol_price_return_warning(w)]
+                merged_warns = list(dict.fromkeys(kept_warns + list(tr_res.warnings)))
+                iol_historical_series[iid] = replace(
+                    hist,
+                    price_series=tr_res.series,
+                    series_type=tr_res.series_type,
+                    is_total_return=tr_res.is_total_return,
+                    warnings=merged_warns,
+                )
+                warnings_list.extend(merged_warns)
+            else:
+                warnings_list.extend(hist.warnings)
+                if not any(_is_iol_price_return_warning(w) for w in hist.warnings):
+                    warnings_list.append(
+                        f"IOL historical series for '{iid}' ({hist.symbol}) represents unadjusted market prices "
+                        "(price return only, NOT total return; coupons and principal amortizations are not reinvested or adjusted by IOL)."
+                    )
+                if tr_res.coverage_status == "convention_blocked" or (
+                    eff_terms is not None and not eff_terms.historical_cashflows_confirmed
+                ):
+                    warnings_list.extend(tr_res.warnings)
+        elif hist_src in ("prices_usd_override", "yfinance") and inst.historical_price_series_type == "market_price":
+            if eff_terms is not None and eff_terms.historical_cashflows_confirmed:
+                base_series = unadjusted_closes.get(inst.ticker.upper()) if hist_src == "yfinance" else prices_cols[iid]
+                if hist_src == "yfinance" and (base_series is None or base_series.empty):
+                    warnings_list.append(
+                        f"Unadjusted yfinance Close series unavailable for '{iid}'; preserving downloaded series without manual cashflow adjustment."
+                    )
+                else:
+                    assert base_series is not None
+                    tr_res = build_fixed_income_historical_return_series(
+                        iid,
+                        base_series,
+                        eff_terms,
+                        price_source=hist_src,
+                        quote_unit=inst.quote_unit or eff_terms.price_convention,
+                        as_of_date=cfg.as_of_date,
+                        duplicate_date_policy=cfg.risk.duplicate_date_policy,
+                        target_tz=cfg.risk.weekly_cutoff_tz,
+                    )
+                    fixed_income_tr_results[iid] = tr_res
+                    fixed_income_return_diagnostics[iid] = tr_res.diagnostics
+                    if tr_res.is_total_return or tr_res.coverage_status == "partial":
+                        prices_cols[iid] = tr_res.series.rename(iid)
+                    warnings_list.extend(tr_res.warnings)
+            elif inst.asset_subtype in INDIVIDUAL_DEBT_SUBTYPES:
+                tr_res = build_fixed_income_historical_return_series(
+                    iid,
+                    prices_cols[iid],
+                    eff_terms,
+                    price_source=hist_src,
+                    quote_unit=inst.quote_unit or (eff_terms.price_convention if eff_terms is not None else None),
+                    as_of_date=cfg.as_of_date,
+                    duplicate_date_policy=cfg.risk.duplicate_date_policy,
+                    target_tz=cfg.risk.weekly_cutoff_tz,
+                )
+                fixed_income_tr_results[iid] = tr_res
+                fixed_income_return_diagnostics[iid] = tr_res.diagnostics
+                warnings_list.extend(tr_res.warnings)
+
     fixed_income_metrics: Dict[str, FixedIncomeMetricsResult] = {}
     for inst in cfg.fixed_income:
-        if inst.fixed_income_terms is None:
-            continue
         iid = inst.instrument_id
-        terms = inst.fixed_income_terms
+        eff_inst = effective_inst_map[iid]
+        if eff_inst.fixed_income_terms is None:
+            if inst.asset_subtype in INDIVIDUAL_DEBT_SUBTYPES:
+                warnings_list.append(
+                    f"Individual debt instrument '{iid}' lacks FixedIncomeTerms manual cashflows; "
+                    "automatic YTM (TIR) could not be computed (expected return uses Black-Litterman equilibrium prior)."
+                )
+            continue
+        terms = eff_inst.fixed_income_terms
         px_res = resolved_tradable_prices[iid]
         not_eval_reason = (
             px_res.blocked_reason
@@ -2367,9 +2531,25 @@ def analyze_portfolio(
             quoted_price_currency=px_res.quoted_currency_for_terms,
             quote_source_used=px_res.source,
             valuation_price_date=px_res.price_timestamp,
+            valuation_date=effective_val_dates.get(iid),
             extra_warnings=list(px_res.warnings),
             not_evaluable_reason=not_eval_reason,
         )
+        tr_res = fixed_income_tr_results.get(iid)
+        if tr_res is not None:
+            hist_method = (
+                "total_return"
+                if tr_res.is_total_return
+                else ("partial_total_return" if tr_res.coverage_status == "partial" else "price_return")
+            )
+            fi_res = replace(
+                fi_res,
+                historical_return_method=hist_method,
+                historical_cashflow_coverage=tr_res.coverage_status,
+                historical_cashflows_applied_count=tr_res.cashflow_events_applied,
+                historical_coupons_applied=tr_res.total_coupons_applied,
+                historical_amortizations_applied=tr_res.total_amortizations_applied,
+            )
         fixed_income_metrics[iid] = fi_res
         warnings_list.extend(fi_res.warnings)
 
@@ -2453,7 +2633,7 @@ def analyze_portfolio(
     price_resolution_audit: Dict[str, Dict[str, Any]] = {}
 
     for iid in ordered_ids:
-        inst = inst_map[iid]
+        inst = effective_inst_map[iid]
         px_res = resolved_tradable_prices[iid]
         if px_res.warnings:
             warnings_list.extend(px_res.warnings)
@@ -2465,6 +2645,7 @@ def analyze_portfolio(
                 inst,
                 latest_prices_usd[iid],
                 quote_unit_override=quote_units_by_id.get(iid),
+                valuation_date=effective_val_dates.get(iid),
             )
             execution_prices_usd_per_unit[iid] = float(unit_px)
             price_unit_metadata[iid] = unit_meta
@@ -2521,7 +2702,7 @@ def analyze_portfolio(
         cov_matrix=risk_result.cov_matrix,
         rf_rate=rf_rate,
         bl_config=cfg.black_litterman,
-        instruments_by_id=inst_map,
+        instruments_by_id=effective_inst_map,
         latest_prices_usd=latest_prices_usd,
         fixed_income_metrics=fixed_income_metrics,
         market_caps=m_caps,
@@ -2647,7 +2828,7 @@ def analyze_portfolio(
             tickers=ordered_ids,
             target_weights=strat_res.weights_by_asset,
             prices_usd=latest_prices_usd,
-            instruments_by_id=inst_map,
+            instruments_by_id=effective_inst_map,
             brokers_by_id=cfg.broker_map,
             positions=cfg.positions,
             rebalancing_config=cfg.rebalancing,
@@ -2663,6 +2844,7 @@ def analyze_portfolio(
     quotes_and_dq = {
         "iol_quotes": {k: v.to_dict() for k, v in iol_quotes.items()},
         "iol_historical_metadata": {k: v.to_metadata_dict() for k, v in iol_historical_series.items()},
+        "fixed_income_return_diagnostics": fixed_income_return_diagnostics,
         "latest_prices_usd": latest_prices_usd,
         "execution_prices_usd_per_unit": execution_prices_usd_per_unit,
         "price_unit_metadata": price_unit_metadata,
